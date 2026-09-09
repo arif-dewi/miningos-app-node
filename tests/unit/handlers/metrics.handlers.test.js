@@ -4347,6 +4347,21 @@ test('getDowntime - missing nominal power yields null rates but keeps the power 
   t.pass()
 })
 
+test('getDowntime - falls back to nominalAvailablePowerMWh when the MW key is absent', async (t) => {
+  const mockCtx = downtimeCtx({
+    powerRows: [downtimeHourRow(DOWNTIME_DAY_TS, 18000000)],
+    globalConfig: { nominalAvailablePowerMWh: 22.5 }
+  })
+
+  const result = await getDowntime(mockCtx, {
+    query: { start: DOWNTIME_DAY_TS, end: DOWNTIME_DAY_TS + DOWNTIME_HOUR_MS, interval: '1h' }
+  })
+
+  t.is(result.log[0].nominalPowerW, 22500000, 'MWh-per-hour capacity treated as MW')
+  t.is(result.log[0].downtimeRate, 0.2, 'rates computed against the fallback nominal')
+  t.pass()
+})
+
 test('getDowntime - electricity worker failure degrades to op-issues-only attribution', async (t) => {
   const mockCtx = downtimeCtx({
     powerRows: [downtimeHourRow(DOWNTIME_DAY_TS, 6000000)],

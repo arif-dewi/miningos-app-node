@@ -2032,11 +2032,15 @@ async function getDowntime (ctx, req) {
       end
     }).catch(() => []),
     ctx.dataProxy.requestDataMap(RPC_METHODS.GLOBAL_CONFIG, {
-      fields: { nominalPowerAvailability_MW: 1 }
+      fields: { nominalPowerAvailability_MW: 1, nominalAvailablePowerMWh: 1 }
     })
   ])
 
-  const { nominalPowerAvailability_MW: nominalMW } = extractGlobalConfig(globalConfigRes)
+  // Some deployments store the site capacity as nominalAvailablePowerMWh
+  // (MWh available per hour, i.e. MW) instead of nominalPowerAvailability_MW.
+  const globalConfig = extractGlobalConfig(globalConfigRes)
+  const nominalMW = globalConfig.nominalPowerAvailability_MW ||
+    globalConfig.nominalAvailablePowerMWh
   const nominalPowerW = nominalMW > 0 ? nominalMW * 1000000 : null
 
   const decisionByHour = indexForecastDecisionsByHour(forecastRes)
