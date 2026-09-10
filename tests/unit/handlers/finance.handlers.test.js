@@ -1734,3 +1734,24 @@ test('getProductionCosts - keeps every month overlapping the range', async (t) =
   t.alike(await months(Date.UTC(2026, 7, 15), Date.UTC(2026, 7, 20)), [8], 'a range inside a month keeps that month')
   t.pass()
 })
+
+test('getEbitda - passes a limit that covers every day in the range to mempool history', async (t) => {
+  const start = 1700000000000
+  const end = start + 400 * 86400000
+  const queries = []
+  const mockCtx = withDataProxy({
+    conf: { orks: [{ rpcPublicKey: 'key1' }] },
+    net_r0: {
+      jRequest: async (key, method, payload) => {
+        if (method === 'getWrkExtData' && payload.query) queries.push(payload.query)
+        return []
+      }
+    },
+    globalDataLib: { getGlobalData: async () => [] }
+  })
+
+  await getEbitda(mockCtx, { query: { start, end, period: 'monthly' } }, {})
+
+  const prices = queries.find(q => q.key === 'HISTORICAL_PRICES')
+  t.ok(prices.limit > 400, 'limit exceeds the number of daily rows in the range')
+})

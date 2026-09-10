@@ -18,7 +18,8 @@ const {
   normalizeTimestampMs,
   processTransactions,
   extractCurrentPrice,
-  processBlockData
+  processBlockData,
+  historyLimit
 } = require('./finance.utils')
 
 // Daily site power and hashrate come from the metrics handlers: DCS-aware and averaged per
@@ -56,7 +57,7 @@ async function getEnergyBalance (ctx, req) {
 
     (cb) => ctx.dataProxy.requestData(RPC_METHODS.GET_WRK_EXT_DATA, {
       type: WORKER_TYPES.MEMPOOL,
-      query: { key: 'HISTORICAL_PRICES', start, end }
+      query: { key: 'HISTORICAL_PRICES', start, end, limit: historyLimit(start, end) }
     }).then(r => cb(null, r)).catch(cb),
 
     (cb) => ctx.dataProxy.requestData(RPC_METHODS.GET_WRK_EXT_DATA, {
@@ -329,7 +330,7 @@ async function getEbitda (ctx, req) {
 
     (cb) => ctx.dataProxy.requestData(RPC_METHODS.GET_WRK_EXT_DATA, {
       type: WORKER_TYPES.MEMPOOL,
-      query: { key: 'HISTORICAL_PRICES', start, end }
+      query: { key: 'HISTORICAL_PRICES', start, end, limit: historyLimit(start, end) }
     }).then(r => cb(null, r)).catch(cb),
 
     (cb) => ctx.dataProxy.requestData(RPC_METHODS.GET_WRK_EXT_DATA, {
@@ -478,7 +479,7 @@ async function getCostSummary (ctx, req) {
 
     (cb) => ctx.dataProxy.requestData(RPC_METHODS.GET_WRK_EXT_DATA, {
       type: WORKER_TYPES.MEMPOOL,
-      query: { key: 'HISTORICAL_PRICES', start, end }
+      query: { key: 'HISTORICAL_PRICES', start, end, limit: historyLimit(start, end) }
     }).then(r => cb(null, r)).catch(cb),
 
     (cb) => getDailySeries(ctx, start, end, getConsumption, 'powerW')
@@ -572,7 +573,7 @@ async function getSubsidyFees (ctx, req) {
 
   const blockResults = await ctx.dataProxy.requestData(RPC_METHODS.GET_WRK_EXT_DATA, {
     type: WORKER_TYPES.MEMPOOL,
-    query: { key: 'HISTORICAL_BLOCKSIZES', start, end }
+    query: { key: 'HISTORICAL_BLOCKSIZES', start, end, limit: historyLimit(start, end) }
   })
 
   const dailyBlocks = processBlockData(blockResults)
@@ -757,7 +758,7 @@ async function getRevenueSummary (ctx, req) {
 
     (cb) => ctx.dataProxy.requestData(RPC_METHODS.GET_WRK_EXT_DATA, {
       type: WORKER_TYPES.MEMPOOL,
-      query: { key: 'HISTORICAL_PRICES', start, end }
+      query: { key: 'HISTORICAL_PRICES', start, end, limit: historyLimit(start, end) }
     }).then(r => cb(null, r)).catch(cb),
 
     (cb) => ctx.dataProxy.requestData(RPC_METHODS.GET_WRK_EXT_DATA, {
@@ -776,7 +777,7 @@ async function getRevenueSummary (ctx, req) {
 
     (cb) => ctx.dataProxy.requestData(RPC_METHODS.GET_WRK_EXT_DATA, {
       type: WORKER_TYPES.MEMPOOL,
-      query: { key: 'HISTORICAL_BLOCKSIZES', start, end }
+      query: { key: 'HISTORICAL_BLOCKSIZES', start, end, limit: historyLimit(start, end) }
     }).then(r => cb(null, r)).catch(cb),
 
     (cb) => ctx.dataProxy.requestData(RPC_METHODS.GET_WRK_EXT_DATA, {
@@ -994,7 +995,7 @@ async function getHashRevenue (ctx, req) {
 
     (cb) => ctx.dataProxy.requestData(RPC_METHODS.GET_WRK_EXT_DATA, {
       type: WORKER_TYPES.MEMPOOL,
-      query: { key: 'HISTORICAL_PRICES', start, end }
+      query: { key: 'HISTORICAL_PRICES', start, end, limit: historyLimit(start, end) }
     }).then(r => cb(null, r)).catch(cb),
 
     (cb) => ctx.dataProxy.requestData(RPC_METHODS.GET_WRK_EXT_DATA, {
@@ -1004,7 +1005,7 @@ async function getHashRevenue (ctx, req) {
 
     (cb) => ctx.dataProxy.requestData(RPC_METHODS.GET_WRK_EXT_DATA, {
       type: WORKER_TYPES.MEMPOOL,
-      query: { key: 'HISTORICAL_HASHRATE', start, end }
+      query: { key: 'HISTORICAL_HASHRATE', start, end, limit: historyLimit(start, end) }
     }).then(r => cb(null, r)).catch(cb)
   ])
 
@@ -1219,7 +1220,7 @@ async function getPowerCost (ctx, req) {
 
     (cb) => ctx.dataProxy.requestData(RPC_METHODS.GET_WRK_EXT_DATA, {
       type: WORKER_TYPES.MEMPOOL,
-      query: { key: 'HISTORICAL_PRICES', start, end }
+      query: { key: 'HISTORICAL_PRICES', start, end, limit: historyLimit(start, end) }
     }).then(r => cb(null, r)).catch(cb),
 
     (cb) => getProductionCosts(ctx, start, end)
