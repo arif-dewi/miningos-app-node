@@ -195,6 +195,7 @@ const ENDPOINTS = {
   METRICS_POWER_MODE_TIMELINE: '/auth/metrics/power-mode/timeline',
   METRICS_TEMPERATURE: '/auth/metrics/temperature',
   METRICS_COOLING: '/auth/metrics/cooling',
+  METRICS_DOWNTIME: '/auth/metrics/downtime',
   METRICS_CONTAINER_TELEMETRY: '/auth/metrics/containers/:id',
   METRICS_CONTAINER_HISTORY: '/auth/metrics/containers/:id/history',
 
