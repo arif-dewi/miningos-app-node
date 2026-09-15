@@ -1334,7 +1334,7 @@ test('handlers: exportWorkOrder csv sets text/csv content-type and attachment fi
 })
 
 test('handlers: exportWorkOrdersRma returns CSV of only the MicroBT Miner WOs selected', async (t) => {
-  const miner = { id: 'wo-3', code: 'IVI-3-0001', info: { type: 3, deviceModel: 'M63S++_VL28', deviceIdentifier: 'MINER-SN-1', issue: 'low hashrate', finalResult: 'replaced HB', remarks: 'r', assignedTo: 'eng@test', createdAt: 1, partsMoves: [{ role: 'diagnosis', partCode: 'HB-OLD' }, { role: 'replacement', partCode: 'HB-NEW' }] } }
+  const miner = { id: 'wo-3', code: 'IVI-3-0001', info: { type: 3, deviceModel: 'M63S++_VL28', deviceIdentifier: 'MINER-SN-1', issue: 'low hashrate', finalResult: 'replaced HB', remarks: 'r', assignedTo: 'eng@test', createdAt: 1, partsMoves: [{ role: 'diagnosis', partCode: 'HB-OLD' }, { role: 'out', partCode: 'HB-OLD' }, { role: 'replacement', partCode: 'HB-NEW', replacesPartCode: 'HB-OLD' }] } }
   const move = { id: 'wo-2', code: 'IVI-2-0002', info: { type: 2, partsMoves: [] } }
   const ctx = createMockCtxWithOrks([{ rpcPublicKey: 'k' }], async () => [miner, move])
   const rep = mkRep()
