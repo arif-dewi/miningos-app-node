@@ -132,7 +132,7 @@
         "ticket:rw",
         "work_order:rw",
         "alert_config:rw",
-        "alert_config_sensitive:r",
+        "alert_config_sensitive:rw",
         "pool_config:r"
       ],
       "site_operator": [
