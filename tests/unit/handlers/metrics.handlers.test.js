@@ -4654,3 +4654,41 @@ test('getHashrate 1M - a cached empty month is not rendered as a row', async (t)
   t.alike(result.log, [], 'a tombstone reads as "nothing here", not as an empty object')
   t.pass()
 })
+
+// The generic per-bucket pctOfNominal is miner-based (hashrateMhs / nominalHashrateMhs).
+// Financial reports are pool-only, so the 1M rollup must NOT inherit that: the UI reads
+// this field straight through, and a miner-based month would read far higher than the
+// delivered hashes beside it whenever the pool under-reports.
+test('getHashrate 1M - pctOfNominal follows the pool series, not miner telemetry', async (t) => {
+  const POOL_MHS = 500
+  const ctx = withDataProxy({
+    conf: { orks: [{ rpcPublicKey: 'key1' }] },
+    net_r0: {
+      jRequest: async (key, method, payload) => {
+        if (method === 'getWrkExtData') {
+          const samples = []
+          for (let ts = AUG_1_LOCAL; ts < SEP_1_LOCAL; ts += HOUR) {
+            samples.push({ poolType: 'f2pool', username: 'account-a', ts: ts + 60000, hashrate: POOL_MHS * 1e6 })
+          }
+          return [{ hashrateHistory: samples }]
+        }
+        const out = []
+        for (let ts = payload.start; ts < payload.end; ts += HOUR) {
+          // Miner telemetry claims 1000 of 2000 nominal - 50% on the miner basis.
+          out.push({ ts, hashrate_mhs_5m_sum_aggr: 1000, nominal_hashrate_mhs_sum_aggr: 2000 })
+        }
+        return out
+      }
+    }
+  })
+
+  monthlyHashesCache.clear()
+  const result = await getHashrate(ctx, {
+    query: { start: AUG_1_LOCAL, end: SEP_1_LOCAL - 1, interval: '1M', timezone: MONTHLY_TZ, nominal: true, pool: true }
+  })
+
+  t.is(result.log[0].pctOfNominal, 25, 'pool 500 over nominal 2000, not miner 1000 over 2000')
+  t.is(result.log[0].poolHashrateMhs, POOL_MHS)
+  t.absent(result.log[0].nominalHashrateMhs, 'a month carries no nominal mean - the pairing it needs is per hour, and only here')
+  t.pass()
+})
