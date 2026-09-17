@@ -3,6 +3,7 @@
 const test = require('brittle')
 const {
   getHashrate,
+  monthlyHashesCache,
   calculateHashrateSummary,
   getConsumption,
   rollupMonthly,
@@ -4504,5 +4505,150 @@ test('buildHourlyDowntime + aggregateDowntimeDaily - numeric ts entries fall bac
   t.alike(daily[0].timeRange,
     { startTs: DOWNTIME_DAY_TS, endTs: DOWNTIME_DAY_TS + 24 * DOWNTIME_HOUR_MS - 1 },
     'daily bucket always carries a timeRange')
+  t.pass()
+})
+
+// --- interval=1M: calendar-month rollup -------------------------------------
+
+const MONTHLY_TZ = 'America/Sao_Paulo' // UTC-3, no DST in the window used below
+const AUG_1_LOCAL = Date.UTC(2026, 7, 1, 3) // 00:00 on Aug 1 locally
+const SEP_1_LOCAL = Date.UTC(2026, 8, 1, 3)
+const HOUR = 3600000
+
+// One hourly bucket per hour of the requested span, so a month's rollup is predictable.
+function monthlyCtx (onRequest = () => {}) {
+  return withDataProxy({
+    conf: { orks: [{ rpcPublicKey: 'key1' }] },
+    net_r0: {
+      jRequest: async (key, method, payload) => {
+        onRequest(payload)
+        if (method === 'getWrkExtData') return [{ hashrateHistory: [] }]
+        const out = []
+        for (let ts = payload.start; ts < payload.end; ts += HOUR) {
+          out.push({ ts, hashrate_mhs_5m_sum_aggr: 1000, nominal_hashrate_mhs_sum_aggr: 2000 })
+        }
+        return out
+      }
+    }
+  })
+}
+
+test('getHashrate 1M - one row per calendar month in the requested timezone', async (t) => {
+  const result = await getHashrate(monthlyCtx(), {
+    query: { start: AUG_1_LOCAL, end: SEP_1_LOCAL - 1, interval: '1M', timezone: MONTHLY_TZ, nominal: true }
+  })
+
+  t.is(result.log.length, 1, 'a single local month')
+  t.is(result.log[0].ts, AUG_1_LOCAL, 'stamped at the first bucket of that local month')
+  t.is(result.log[0].hashrateMhs, 1000, 'mean over the month, not a sum')
+  t.is(result.log[0].reportedHours, 744, 'every hour of August reported')
+  t.is(result.totalCount, result.log.length, 'totalCount counts months, not buckets')
+  t.pass()
+})
+
+test('getHashrate 1M - months are cut in the requested zone, not UTC', async (t) => {
+  // 00:00-03:00 UTC on Sep 1 is still August locally, so a UTC-month range spans two.
+  const result = await getHashrate(monthlyCtx(), {
+    query: { start: Date.UTC(2026, 7, 1), end: Date.UTC(2026, 8, 1) - 1, interval: '1M', timezone: MONTHLY_TZ }
+  })
+
+  t.is(result.log.length, 2, 'a UTC August touches two local months')
+  t.pass()
+})
+
+test('getHashrate 1M - a completed month is served from cache on the next request', async (t) => {
+  const spans = []
+  const ctx = monthlyCtx((payload) => { if (payload.start) spans.push([payload.start, payload.end]) })
+  const query = { start: AUG_1_LOCAL, end: SEP_1_LOCAL - 1, interval: '1M', timezone: MONTHLY_TZ }
+
+  monthlyHashesCache.clear()
+  const first = await getHashrate(ctx, { query })
+  const firstSpans = spans.length
+  const second = await getHashrate(ctx, { query })
+
+  t.ok(firstSpans > 0, 'the first request queries the store')
+  t.is(spans.length, firstSpans, 'the second asks the store for nothing at all')
+  t.alike(second.log, first.log, 'and returns the same rows')
+  t.pass()
+})
+
+test('getHashrate 1M - the running month is never cached', async (t) => {
+  const spans = []
+  const now = Date.now()
+  const monthStart = new Date(now)
+  monthStart.setUTCDate(1)
+  monthStart.setUTCHours(0, 0, 0, 0)
+  const ctx = monthlyCtx((payload) => { if (payload.start) spans.push(payload.start) })
+  const query = { start: monthStart.getTime(), end: now, interval: '1M', timezone: 'UTC' }
+
+  monthlyHashesCache.clear()
+  await getHashrate(ctx, { query })
+  const afterFirst = spans.length
+  await getHashrate(ctx, { query })
+
+  t.ok(spans.length > afterFirst, 'the month still gaining hours is recomputed every time')
+  t.is(monthlyHashesCache.size, 0, 'and nothing about it is retained')
+  t.pass()
+})
+
+test('getHashrate 1M - a month the site reported nothing for is absent, not zero-filled', async (t) => {
+  const ctx = withDataProxy({
+    conf: { orks: [{ rpcPublicKey: 'key1' }] },
+    net_r0: { jRequest: async (key, method) => method === 'getWrkExtData' ? [{ hashrateHistory: [] }] : [] }
+  })
+
+  monthlyHashesCache.clear()
+  const result = await getHashrate(ctx, {
+    query: { start: AUG_1_LOCAL, end: SEP_1_LOCAL - 1, interval: '1M', timezone: MONTHLY_TZ }
+  })
+
+  t.alike(result.log, [], 'no buckets means no month row - the caller knows its own window')
+  t.pass()
+})
+
+test('getHashrate 1M - a completed month with no data stops widening the query span', async (t) => {
+  const spans = []
+  // Data exists only from August; July is silent but completed.
+  const ctx = withDataProxy({
+    conf: { orks: [{ rpcPublicKey: 'key1' }] },
+    net_r0: {
+      jRequest: async (key, method, payload) => {
+        if (method === 'getWrkExtData') return [{ hashrateHistory: [] }]
+        spans.push([payload.start, payload.end])
+        const out = []
+        for (let ts = Math.max(payload.start, AUG_1_LOCAL); ts < payload.end; ts += HOUR) {
+          out.push({ ts, hashrate_mhs_5m_sum_aggr: 1000, nominal_hashrate_mhs_sum_aggr: 2000 })
+        }
+        return out
+      }
+    }
+  })
+  const query = {
+    start: Date.UTC(2026, 6, 1, 3), // July 1 locally
+    end: SEP_1_LOCAL - 1,
+    interval: '1M',
+    timezone: MONTHLY_TZ
+  }
+
+  monthlyHashesCache.clear()
+  await getHashrate(ctx, { query })
+  await getHashrate(ctx, { query })
+
+  t.is(spans.length, 1, 'the second request queries nothing: both months are settled')
+  // A silent month produces no row to cache, so without a tombstone it stays missing
+  // and every later request stretches the span back over it.
+  t.is(monthlyHashesCache.size, 2, 'the silent month is remembered as empty, alongside the one with data')
+  t.pass()
+})
+
+test('getHashrate 1M - a cached empty month is not rendered as a row', async (t) => {
+  const ctx = monthlyCtx()
+  const query = { start: AUG_1_LOCAL, end: SEP_1_LOCAL - 1, interval: '1M', timezone: MONTHLY_TZ }
+
+  monthlyHashesCache.clear()
+  monthlyHashesCache.set(monthlyHashesCache.key('2026-08', MONTHLY_TZ, { nominal: false, pool: false }), null)
+  const result = await getHashrate(ctx, { query })
+
+  t.alike(result.log, [], 'a tombstone reads as "nothing here", not as an empty object')
   t.pass()
 })

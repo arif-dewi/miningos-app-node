@@ -38,10 +38,14 @@ const {
   getIntervalConfig,
   mergeGroupedField,
   extractKeyEntry,
+  rollupLocalMonths,
+  localMonthsInRange,
+  localMonthKey,
   mhsToThs,
   rackFilterFor
 } = require('../../metrics.utils')
 const { parseRacks } = require('../lib/queryUtils')
+const { createMonthlyHashesCache } = require('../lib/monthlyHashesCache')
 const { resolvePoolHashrateForBuckets } = require('./pools.handlers')
 const { extractGlobalConfig } = require('./site.utils')
 const { normalizeAvailability } = require('../lib/export/types/forecast.export')
@@ -99,8 +103,82 @@ function pageHashrate (req, { log, summary }) {
   }
 }
 
+const monthlyHashesCache = createMonthlyHashesCache()
+
 async function getHashrate (ctx, req) {
+  // '1M' means a calendar-month rollup, as it already does for consumption - not the
+  // store's rolling-30-day bucket that getIntervalConfig would hand back for it.
+  if (req.query.interval === '1M') return getMonthlyHashrate(ctx, req)
+
   return pageHashrate(req, await resolveHashrate(ctx, req))
+}
+
+/**
+ * Calendar months instead of raw buckets, in `timezone` when one is given (the
+ * consumption endpoint's '1M' is UTC-aligned; invoicing bills the site's own month).
+ *
+ * The store cannot bucket by calendar month (groupRange '1M' is a rolling 30 days)
+ * and its daily buckets are UTC-aligned, so a month is still built from hourly ones -
+ * but rolling them up HERE means the caller receives a handful of rows instead of the
+ * ~8,760 buckets a year of hours costs to ship and re-aggregate.
+ *
+ * Months that have ended are served from a per-process cache, so a repeat request
+ * only recomputes the running month. Months the site reported nothing for are absent
+ * rather than zero-filled; the caller knows the window it asked for and can say so.
+ */
+async function getMonthlyHashrate (ctx, req) {
+  const { start, end } = validateStartEnd(req)
+  const timezone = req.query.timezone || 'UTC'
+  const now = Date.now()
+  const flags = {
+    nominal: req.query.nominal === true || req.query.nominal === 'true',
+    pool: req.query.pool === true || req.query.pool === 'true'
+  }
+
+  const months = localMonthsInRange(start, end, timezone)
+  const rows = new Map()
+  const missing = []
+
+  for (const month of months) {
+    // The running month still gains hours - never read or write it to the cache.
+    const cached = month.end < now
+      ? monthlyHashesCache.get(monthlyHashesCache.key(month.key, timezone, flags), now)
+      : undefined
+
+    if (cached !== undefined) rows.set(month.key, cached)
+    else missing.push(month)
+  }
+
+  if (missing.length) {
+    // One query over the span the misses cover, clamped to what was actually asked
+    // for: the first and last month of a range are usually partial.
+    const span = {
+      start: Math.max(start, missing[0].start),
+      end: Math.min(end, missing[missing.length - 1].end)
+    }
+    const { log } = await resolveHashrate(ctx, {
+      ...req,
+      query: { ...req.query, ...span, interval: '1h' }
+    })
+
+    for (const row of rollupLocalMonths(log, timezone)) {
+      rows.set(localMonthKey(row.ts, timezone), row)
+    }
+
+    // A completed month the site never reported is cached as null, not skipped: it
+    // produces no row to cache, so leaving it out keeps it permanently missing and
+    // the query span keeps stretching back over it on every request.
+    for (const month of missing) {
+      if (month.end >= now) continue
+
+      const key = monthlyHashesCache.key(month.key, timezone, flags)
+      monthlyHashesCache.set(key, rows.get(month.key) ?? null, now)
+    }
+  }
+
+  const log = months.map((month) => rows.get(month.key)).filter(Boolean)
+
+  return { log, totalCount: log.length, summary: calculateHashrateSummary(log, flags.nominal) }
 }
 
 async function resolveHashrate (ctx, req) {
@@ -2054,6 +2132,8 @@ async function getDowntime (ctx, req) {
 module.exports = {
   ...require('../../metrics.utils'),
   getHashrate,
+  getMonthlyHashrate,
+  monthlyHashesCache,
   calculateHashrateSummary,
   calculateGroupedHashrateSummary,
   getConsumption,
