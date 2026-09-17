@@ -159,7 +159,7 @@ test('invoicing-monthly-hashes - one row per UTC month when the export is asked 
 test('invoicing-monthly-hashes - hourly buckets roll up into the requested timezone months', async (t) => {
   const { out } = await runExport(
     'invoicing-monthly-hashes',
-    { start: START, end: START + 2 * DAY_MS, timezone: 'America/Sao_Paulo', format: 'csv' },
+    { start: START, end: START + 2 * DAY_MS, timezone: 'Etc/GMT+3', format: 'csv' },
     { buckets: 48, interval: HOUR_MS }
   )
   const lines = out.split('\n')

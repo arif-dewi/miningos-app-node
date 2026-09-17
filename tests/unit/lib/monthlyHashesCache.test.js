@@ -4,7 +4,9 @@ const test = require('brittle')
 const { createMonthlyHashesCache } = require('../../../workers/lib/server/lib/monthlyHashesCache')
 const { localMonthsInRange, localMonthKey } = require('../../../workers/lib/metrics.utils')
 
-const TZ = 'America/Sao_Paulo' // UTC-3, no DST in the windows below
+// Fixed -03:00 (Etc/GMT+3 is UTC-03:00 - POSIX inverts the sign), so the expected
+// instants hold regardless of the runner's zone and of any DST rule.
+const TZ = 'Etc/GMT+3'
 const FLAGS = { nominal: true, pool: true }
 
 test('monthlyHashesCache - a month is only reusable for the zone and series it was cut for', (t) => {

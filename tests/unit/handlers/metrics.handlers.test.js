@@ -4510,7 +4510,9 @@ test('buildHourlyDowntime + aggregateDowntimeDaily - numeric ts entries fall bac
 
 // --- interval=1M: calendar-month rollup -------------------------------------
 
-const MONTHLY_TZ = 'America/Sao_Paulo' // UTC-3, no DST in the window used below
+// A fixed -03:00 zone (Etc/GMT+3 is UTC-03:00 - POSIX inverts the sign): whole-hour
+// offset and no DST, so the expected instants below hold whatever the runner's zone is.
+const MONTHLY_TZ = 'Etc/GMT+3'
 const AUG_1_LOCAL = Date.UTC(2026, 7, 1, 3) // 00:00 on Aug 1 locally
 const SEP_1_LOCAL = Date.UTC(2026, 8, 1, 3)
 const HOUR = 3600000
