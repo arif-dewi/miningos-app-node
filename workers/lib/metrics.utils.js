@@ -288,17 +288,21 @@ function invoicePeriodPoolPctOfNominal (entries) {
   return (pool / sum(nominalBuckets.map((entry) => entry.nominalHashrateMhs))) * 100
 }
 
-function rollupLocalDays (log, timezone) {
-  const dayOf = new Intl.DateTimeFormat('en-CA', { timeZone: timezone, year: 'numeric', month: '2-digit', day: '2-digit' })
-  const days = new Map()
+// Groups hourly buckets by the label `periodOf` gives them and aggregates each
+// group the way the invoicing rows need it. `poolSeconds` counts only the hours
+// that carried a pool sample, so a polling gap understates the period's delivered
+// hashes rather than reading as lost hashrate - the export marks that, it does not
+// silently fill it in.
+function rollupLocalPeriods (log, periodOf) {
+  const periods = new Map()
 
   for (const entry of log) {
-    const key = dayOf.format(new Date(entry.ts))
-    if (!days.has(key)) days.set(key, [])
-    days.get(key).push(entry)
+    const key = periodOf.format(new Date(entry.ts))
+    if (!periods.has(key)) periods.set(key, [])
+    periods.get(key).push(entry)
   }
 
-  return [...days.values()].map((entries) => {
+  return [...periods.values()].map((entries) => {
     const pool = finiteValues(entries, 'poolHashrateMhs')
 
     return {
@@ -309,6 +313,20 @@ function rollupLocalDays (log, timezone) {
       poolSeconds: pool.length * 3600
     }
   })
+}
+
+function rollupLocalDays (log, timezone) {
+  return rollupLocalPeriods(log, new Intl.DateTimeFormat('en-CA', {
+    timeZone: timezone, year: 'numeric', month: '2-digit', day: '2-digit'
+  }))
+}
+
+// The backend has no calendar-month bucket (groupRange '1M' is a rolling 30 days),
+// so a site-local month is rebuilt from its hourly buckets the same way a local day is.
+function rollupLocalMonths (log, timezone) {
+  return rollupLocalPeriods(log, new Intl.DateTimeFormat('en-CA', {
+    timeZone: timezone, year: 'numeric', month: '2-digit'
+  }))
 }
 
 module.exports = {
@@ -323,6 +341,7 @@ module.exports = {
   resolveInterval,
   getIntervalConfig,
   rollupLocalDays,
+  rollupLocalMonths,
   poolPctOfNominal,
   invoicePeriodPoolPctOfNominal,
   mhsToPhs,
