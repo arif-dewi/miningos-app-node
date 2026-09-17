@@ -308,6 +308,10 @@ function rollupLocalPeriods (log, periodOf) {
     return {
       ts: entries[0].ts,
       hashrateMhs: mean(finiteValues(entries, 'hashrateMhs')),
+      // The period's installed capacity, for callers that summarise a run of periods.
+      // `pctOfNominal` is NOT this over hashrateMhs - it stays on the pool basis below,
+      // which pairs the two series hour by hour and can only be computed here.
+      nominalHashrateMhs: mean(finiteValues(entries, 'nominalHashrateMhs')),
       poolHashrateMhs: mean(pool),
       pctOfNominal: poolPctOfNominal(entries),
       poolSeconds: pool.length * 3600,

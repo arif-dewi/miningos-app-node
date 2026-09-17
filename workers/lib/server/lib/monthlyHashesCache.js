@@ -18,10 +18,12 @@ function createMonthlyHashesCache ({ ttlMs = DEFAULT_TTL_MS, maxEntries = DEFAUL
   const entries = new Map()
 
   return {
-    // A month's rollup depends on the zone it was cut in, and on whether the
-    // caller asked for the nominal and pool series at all.
-    key (monthKey, timezone, { nominal, pool }) {
-      return `${monthKey}|${timezone}|${nominal ? 'n' : ''}${pool ? 'p' : ''}`
+    // A month's rollup depends on the zone it was cut in, on the slice of the site it
+    // covers, and on whether the caller asked for the nominal and pool series at all.
+    // Everything that changes the numbers has to be in here: a scoped request that
+    // shared a key with the site-wide one would serve its numbers for the whole TTL.
+    key (monthKey, timezone, { nominal, pool, container } = {}) {
+      return `${monthKey}|${timezone}|${container || ''}|${nominal ? 'n' : ''}${pool ? 'p' : ''}`
     },
 
     get (key, now = Date.now()) {

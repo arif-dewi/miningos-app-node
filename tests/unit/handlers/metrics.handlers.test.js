@@ -4689,6 +4689,125 @@ test('getHashrate 1M - pctOfNominal follows the pool series, not miner telemetry
 
   t.is(result.log[0].pctOfNominal, 25, 'pool 500 over nominal 2000, not miner 1000 over 2000')
   t.is(result.log[0].poolHashrateMhs, POOL_MHS)
-  t.absent(result.log[0].nominalHashrateMhs, 'a month carries no nominal mean - the pairing it needs is per hour, and only here')
+  t.is(result.log[0].nominalHashrateMhs, 2000, 'the month still carries the installed capacity it was measured against')
+  t.is(result.summary.avgPoolHashrateMhs, POOL_MHS, 'and the pool average the other intervals report')
+  t.pass()
+})
+
+// A cache keyed on the month alone would hand a scoped request the site-wide numbers,
+// and keep doing it for the whole TTL - the scope has to be part of the key.
+test('getHashrate 1M - a container-scoped month is not answered with another scope', async (t) => {
+  const ctx = withDataProxy({
+    conf: { orks: [{ rpcPublicKey: 'key1' }] },
+    net_r0: {
+      jRequest: async (key, method, payload) => {
+        if (method === 'getWrkExtData') return [{ hashrateHistory: [] }]
+        const out = []
+        for (let ts = payload.start; ts < payload.end; ts += HOUR) {
+          out.push({
+            ts,
+            hashrate_mhs_5m_sum_aggr: 1000,
+            hashrate_mhs_5m_container_group_sum_aggr: { 'container-A': 100, 'container-B': 200 }
+          })
+        }
+        return out
+      }
+    }
+  })
+  const query = { start: AUG_1_LOCAL, end: SEP_1_LOCAL - 1, interval: '1M', timezone: MONTHLY_TZ }
+
+  monthlyHashesCache.clear()
+  const siteWide = await getHashrate(ctx, { query })
+  const containerA = await getHashrate(ctx, { query: { ...query, container: 'container-A' } })
+  const containerB = await getHashrate(ctx, { query: { ...query, container: 'container-B' } })
+
+  t.is(siteWide.log[0].hashrateMhs, 1000, 'the site-wide month')
+  t.is(containerA.log[0].hashrateMhs, 100, 'a container gets its own numbers, not the cached site-wide ones')
+  t.is(containerB.log[0].hashrateMhs, 200, 'and so does the next one')
+  t.pass()
+})
+
+// A grouped series comes off the daily grouped log, where hashrateMhs is a map and
+// there is no per-hour pool pairing: rolling it into months would produce nulls and
+// an "hours reported" count that is really a day count.
+test('getHashrate 1M - a grouped or rack-scoped request keeps the grouped series', async (t) => {
+  const ctx = withDataProxy({
+    conf: { orks: [{ rpcPublicKey: 'key1' }] },
+    net_r0: {
+      jRequest: async () => [
+        { ts: AUG_1_LOCAL, hashrate_mhs_5m_container_group_sum_aggr: { 'container-A': 100 } }
+      ]
+    }
+  })
+
+  monthlyHashesCache.clear()
+  const grouped = await getHashrate(ctx, {
+    query: { start: AUG_1_LOCAL, end: SEP_1_LOCAL - 1, interval: '1M', timezone: MONTHLY_TZ, groupBy: 'container' }
+  })
+
+  t.alike(grouped.log[0].hashrateMhs, { 'container-A': 100 }, 'still the grouped map, not a month mean of it')
+
+  const rackCtx = withDataProxy({
+    conf: { orks: [{ rpcPublicKey: 'key1' }] },
+    net_r0: {
+      jRequest: async () => [
+        { ts: AUG_1_LOCAL, hashrate_mhs_5m_pdu_rack_group_sum_aggr: { 'group-1_1-1': 1000, 'group-2_2-1': 3000 } }
+      ]
+    }
+  })
+  const rackScoped = await getHashrate(rackCtx, {
+    query: { start: AUG_1_LOCAL, end: SEP_1_LOCAL - 1, interval: '1M', timezone: MONTHLY_TZ, racks: 'group-1_rack-1' }
+  })
+
+  t.is(rackScoped.log[0].hashrateMhs, 1000, 'a rack filter still collapses the rack series to a scalar per bucket')
+  t.is(monthlyHashesCache.size, 0, 'and neither shape reaches the monthly cache')
+  t.pass()
+})
+
+// The first and last month of a range are usually partial. A slice of August is not
+// August: storing one under August's key, or answering an August request with one,
+// silently bills the caller for the hours the slice happened to cover.
+test('getHashrate 1M - a partially covered month is neither cached nor served from cache', async (t) => {
+  const spans = []
+  const ctx = monthlyCtx((payload) => { if (payload.start) spans.push([payload.start, payload.end]) })
+  const halfAugust = { start: AUG_1_LOCAL + 14 * 24 * HOUR, end: SEP_1_LOCAL - 1, interval: '1M', timezone: MONTHLY_TZ }
+
+  monthlyHashesCache.clear()
+  const partial = await getHashrate(ctx, { query: halfAugust })
+
+  t.is(partial.log[0].reportedHours, 17 * 24, 'the slice reports only its own hours')
+  t.is(monthlyHashesCache.size, 0, 'and is not stored as the month')
+
+  const whole = await getHashrate(ctx, { query: { ...halfAugust, start: AUG_1_LOCAL } })
+  t.is(whole.log[0].reportedHours, 744, 'the whole month is computed, not served from the slice')
+  t.is(monthlyHashesCache.size, 1, 'and it is the whole month that gets cached')
+
+  const secondPartial = await getHashrate(ctx, { query: halfAugust })
+  t.is(secondPartial.log[0].reportedHours, 17 * 24, 'a later slice is not answered with the cached whole month')
+  t.is(spans.length, 3, 'each slice is recomputed')
+  t.pass()
+})
+
+test('getHashrate 1M - summary carries the nominal and pool figures the other intervals do', async (t) => {
+  monthlyHashesCache.clear()
+  const result = await getHashrate(monthlyCtx(), {
+    query: { start: AUG_1_LOCAL, end: SEP_1_LOCAL - 1, interval: '1M', timezone: MONTHLY_TZ, nominal: true }
+  })
+
+  t.is(result.summary.avgHashrateMhs, 1000)
+  t.is(result.summary.nominalHashrateMhs, 2000, 'the installed capacity, not 0')
+  t.is(result.summary.avgPctOfNominal, 50, 'and a percentage, not null')
+  t.pass()
+})
+
+test('getHashrate 1M - an unknown timezone is a named bad request, not a raw Intl throw', async (t) => {
+  monthlyHashesCache.clear()
+  await t.exception(
+    getHashrate(monthlyCtx(), {
+      query: { start: AUG_1_LOCAL, end: SEP_1_LOCAL - 1, interval: '1M', timezone: 'Mars/Olympus_Mons' }
+    }),
+    /ERR_EXPORT_TIMEZONE_INVALID/,
+    'the same error the exports raise for the same input'
+  )
   t.pass()
 })

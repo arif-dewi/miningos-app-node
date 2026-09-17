@@ -18,6 +18,16 @@ test('monthlyHashesCache - a month is only reusable for the zone and series it w
     cache.key('2026-08', TZ, { nominal: false, pool: true }),
     'a rollup without the nominal series is a different entry'
   )
+  t.not(
+    cache.key('2026-08', TZ, FLAGS),
+    cache.key('2026-08', TZ, { ...FLAGS, container: 'container-A' }),
+    'and a container-scoped month is not the site-wide one'
+  )
+  t.not(
+    cache.key('2026-08', TZ, { ...FLAGS, container: 'container-A' }),
+    cache.key('2026-08', TZ, { ...FLAGS, container: 'container-B' }),
+    'nor another container\'s'
+  )
   t.pass()
 })
 
