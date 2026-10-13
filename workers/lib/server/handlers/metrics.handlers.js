@@ -243,7 +243,7 @@ async function resolveHashrate (ctx, req, phase = null) {
   }
 
   const interval = resolveInterval(start, end, req.query.interval)
-  if (isLocalInterval(interval)) return resolveLocalHashrate(ctx, req, { interval, start, end })
+  if (isLocalInterval(interval)) return resolveLocalHashrate(ctx, req, { interval, start, end }, phase)
 
   const { key, groupRange } = getIntervalConfig(interval)
   const container = req.query.container || null
@@ -312,12 +312,12 @@ async function resolveHashrate (ctx, req, phase = null) {
 // Days and weeks are cut in the site's zone from hourly buckets: the store's own '1D'/'1W'
 // sit on the UTC grid, so they started before `start` and spilled past `end` for any site
 // not on UTC. Each bucket averages its hours, as the store averaged its samples.
-async function resolveLocalHashrate (ctx, req, { interval, start, end }) {
+async function resolveLocalHashrate (ctx, req, { interval, start, end }, phase = null) {
   const timezone = resolveTimezone(ctx, req)
   const withNominal = req.query.nominal === true || req.query.nominal === 'true'
   const withPool = req.query.pool === true || req.query.pool === 'true'
 
-  const hourly = await resolveHashrate(ctx, { ...req, query: { ...req.query, interval: '1h' } })
+  const hourly = await resolveHashrate(ctx, { ...req, query: { ...req.query, interval: '1h' } }, phase)
 
   const log = groupLocalBuckets(hourly.log, { interval, timezone, start, end }).map(({ ts, timeRange, entries }) => {
     const hashrateMhs = meanOfField(entries, 'hashrateMhs')
@@ -391,15 +391,20 @@ async function resolvePoolOnlyHashrate (ctx, req, phase) {
   }
 
   const { start, end } = validateStartEnd(req)
-  const { groupRange } = getIntervalConfig(resolveInterval(start, end, req.query.interval))
-  const hourMs = 60 * 60 * 1_000
-  const bucketMs = RANGE_BUCKETS[groupRange] || hourMs // '1H'
+  const interval = resolveInterval(start, end, req.query.interval)
   const accounts = lPhases.getPhaseAccountKeys(phase)
 
-  const buckets = []
-  for (let ts = Math.floor(start / bucketMs) * bucketMs; ts <= end; ts += bucketMs) {
-    buckets.push({ ts, startTs: ts, endTs: ts + bucketMs - 1 })
+  // Cut on the same grid as the phase's consumption and efficiency: whole hours inside
+  // the range, and days/weeks in the site's zone clamped to [start, end]. The UTC grid
+  // started the first bucket before `start` and ran the last one past `end`.
+  const hours = []
+  for (let ts = Math.ceil(start / HOUR_MS) * HOUR_MS; ts <= end; ts += HOUR_MS) {
+    hours.push({ ts, timeRange: { startTs: ts, endTs: ts + HOUR_MS - 1 } })
   }
+  const slots = isLocalInterval(interval)
+    ? groupLocalBuckets(hours, { interval, timezone: resolveTimezone(ctx, req), start, end })
+    : hours
+  const buckets = slots.map(({ ts, timeRange }) => ({ ts, ...timeRange }))
 
   const poolByBucket = await resolvePoolHashrateForBuckets(ctx, { start, end, buckets, accounts })
 
@@ -414,7 +419,7 @@ async function resolvePoolOnlyHashrate (ctx, req, phase) {
 
     const entry = {
       ts: bucket.ts,
-      ...(bucketMs > hourMs && { timeRange: { startTs: bucket.startTs, endTs: bucket.endTs } }),
+      timeRange: { startTs: bucket.startTs, endTs: bucket.endTs },
       hashrateMhs
     }
 
