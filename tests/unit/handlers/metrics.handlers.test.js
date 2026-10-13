@@ -1121,6 +1121,26 @@ test('getHashrate - daily buckets are the site local days, bounded by start/end'
   t.is(result.summary.avgHashrateMhs, 125)
 })
 
+test('getHashrate - in a +05:30 zone the first local day starts at start, like consumption', async (t) => {
+  // Local midnight in Asia/Kolkata is 18:30Z, so the store's first hourly bucket is
+  // labelled 18:00Z - half an hour before `start`, in the previous local day.
+  const start = Date.UTC(2026, 9, 10, 18, 30)
+  const end = start + 2 * L_DAY - 1
+  const rows = []
+  for (let ts = start - L_HOUR / 2; ts <= end; ts += L_HOUR) rows.push({ ts, hashrate_mhs_5m_sum_aggr: 100 })
+  const ctx = localSiteCtx(rows)
+
+  const daily = await getHashrate(ctx, { query: { start, end, interval: '1d', timezone: 'Asia/Kolkata' } })
+
+  t.alike(daily.log.map(({ ts, timeRange }) => ({ ts, timeRange })), [
+    { ts: start, timeRange: { startTs: start, endTs: start + L_DAY - 1 } },
+    { ts: start + L_DAY, timeRange: { startTs: start + L_DAY, endTs: end } }
+  ], 'no empty bucket before the first local day')
+
+  const hourly = await getHashrate(ctx, { query: { start, end, interval: '1h', timezone: 'Asia/Kolkata' } })
+  t.is(hourly.log[0].ts, start, 'the straddling hour is clamped to start')
+})
+
 test('getEfficiency - daily buckets are the site local days, bounded by start/end', async (t) => {
   const start = L_OCT1
   const end = L_OCT1 + 2 * L_DAY - 1

@@ -273,11 +273,17 @@ async function resolveHashrate (ctx, req, phase = null) {
   const siteNominalMhs = withSiteNominal ? await getSiteNominalHashrate(ctx) : null
 
   const log = firstOrkEntries(res).map(val => {
-    const timeRange = parseEntryTimeRange(val.ts)
+    // The store labels a bucket with its start on the UTC grid, so in a zone off the whole
+    // hour (e.g. +05:30) the first hour began before `start`: it only holds samples from
+    // `start` on, but its ts sat in the previous local day and a '1d'/'1w' rollup opened
+    // with an empty, inverted bucket. Clamped like consumption's, it lands inside the range.
+    const ts = Math.max(start, parseEntryTs(val.ts))
+    const rawRange = parseEntryTimeRange(val.ts)
+    const timeRange = rawRange && { startTs: Math.max(start, rawRange.startTs), endTs: Math.min(end, rawRange.endTs) }
     const hashrateMhs = readHashrate(val[aggrField], container)
     if (!withNominal) {
       return {
-        ts: parseEntryTs(val.ts),
+        ts,
         ...(timeRange && { timeRange }),
         hashrateMhs
       }
@@ -285,7 +291,7 @@ async function resolveHashrate (ctx, req, phase = null) {
 
     const nominalHashrateMhs = siteNominalMhs ?? (Number(val[AGGR_FIELDS.NOMINAL_HASHRATE_SUM]) || 0)
     return {
-      ts: parseEntryTs(val.ts),
+      ts,
       ...(timeRange && { timeRange }),
       hashrateMhs,
       nominalHashrateMhs,
