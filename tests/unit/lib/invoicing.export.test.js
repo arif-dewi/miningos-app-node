@@ -12,12 +12,13 @@ const MHS = 1e11
 const NOMINAL_MHS = 1.25e11
 const POOL_HS = 9.9e16 // 99 PH/s, pool stats are in H/s
 
-function mockCtx ({ buckets = 3, interval = HOUR_MS, globalData = {}, hashrateMhs = MHS, poolHashrateHs = POOL_HS, poolBuckets = null } = {}) {
+function mockCtx ({ buckets = 3, interval = HOUR_MS, globalData = {}, hashrateMhs = MHS, poolHashrateHs = POOL_HS, poolBuckets = null, siteNominalMhs } = {}) {
   return withDataProxy({
     conf: { orks: [{ rpcPublicKey: 'key1' }] },
     globalDataLib: { getGlobalData: async ({ type }) => globalData[type] },
     net_r0: {
       jRequest: async (key, method, params) => {
+        if (method === 'getGlobalConfig') return { nominalSiteHashrate_MHS: siteNominalMhs }
         if (method === 'getWrkExtData') {
           return [{
             hashrateHistory: poolHashrateHs === null
@@ -190,8 +191,9 @@ test('invoice-breakdown - one row, margin applied over energy, ops and payable a
     'invoice-breakdown',
     { start: START, end: START + 2 * DAY_MS, timezone: 'UTC', format: 'json' },
     {
-      buckets: 2,
-      interval: DAY_MS,
+      // '1d' is rolled up from the store's hourly buckets
+      buckets: 48,
+      interval: HOUR_MS,
       globalData: {
         costParameters: {
           lcoe: { effectiveUsdPerMwh: 50 },
@@ -207,7 +209,7 @@ test('invoice-breakdown - one row, margin applied over energy, ops and payable a
 
   t.is(row.year, 2026)
   t.is(row.month, 8)
-  t.is(row.energyConsumedMwh, 480, '10 MW over two daily buckets')
+  t.is(row.energyConsumedMwh, 480, '10 MW over two days of hourly buckets')
   t.is(row.energyCostsUsd, 24000, '480 MWh x 50 USD/MWh')
   t.is(row.operationalCostUsd, 5000, 'read from the month production costs')
   t.is(row.pctOfNominal, 79.2, 'pool vs nominal over the month, not the miner summary')
@@ -220,10 +222,11 @@ test('invoice-breakdown - one row, margin applied over energy, ops and payable a
 
 test('invoice-breakdown - hours without pool data count as zero delivered, not dropped', async (t) => {
   // 4 hourly buckets, pool samples only in the first 2: the invoice bills the whole
-  // period, so the share halves instead of staying at the covered-hours 79.2%.
+  // period, so the share halves instead of staying at the covered-hours 79.2%. Only the
+  // hourly (localMonth) basis keeps the uncovered hours as their own buckets.
   const { out } = await runExport(
     'invoice-breakdown',
-    { start: START, end: START + 4 * HOUR_MS, timezone: 'UTC', format: 'json' },
+    { start: START, end: START + 4 * HOUR_MS, timezone: 'UTC', localMonth: true, format: 'json' },
     {
       buckets: 4,
       interval: HOUR_MS,
@@ -302,11 +305,26 @@ test('invoice-breakdown - localMonth bills the requested timezone month from hou
   t.pass()
 })
 
+test('invoicing exports measure % of nominal against the configured site nominal', async (t) => {
+  const params = { start: START, end: START + 2 * DAY_MS, timezone: 'UTC', format: 'json', localMonth: 'true' }
+  const ctxOpts = { buckets: 48, interval: HOUR_MS, siteNominalMhs: 1.5e11 }
+
+  const { out: breakdown } = await runExport('invoice-breakdown', params, ctxOpts)
+  t.is(JSON.parse(breakdown).breakdown[0].pctOfNominal, 66, '99 PH/s pool vs the 150 PH/s site nominal, not the 125 PH/s installed')
+
+  const { out: hourly } = await runExport('invoicing-hourly-hashes', params, ctxOpts)
+  t.is(JSON.parse(hourly).hashes[0].pctOfNominal, 66)
+
+  const { out: unset } = await runExport('invoice-breakdown', params, { buckets: 48, interval: HOUR_MS })
+  t.is(JSON.parse(unset).breakdown[0].pctOfNominal, 79.2, 'falls back to the installed nominal when the site nominal is not configured')
+  t.pass()
+})
+
 test('invoice-breakdown - a missing input nulls its dependents, never zeroes them', async (t) => {
   const { out } = await runExport(
     'invoice-breakdown',
     { start: START, end: START + 2 * DAY_MS, timezone: 'UTC', format: 'json' },
-    { buckets: 2, interval: DAY_MS, globalData: { costParameters: { marginPct: 10 } } }
+    { buckets: 48, interval: HOUR_MS, globalData: { costParameters: { marginPct: 10 } } }
   )
   const row = JSON.parse(out).breakdown[0]
 

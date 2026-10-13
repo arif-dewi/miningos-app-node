@@ -100,6 +100,7 @@ async function setPoolRebatesData (ctx, data) {
   // Deletes always tombstone the txid in the mempool worker (idempotent, even
   // for manual rows), so a removed transaction can never return via the sync.
   if (data?.remove) {
+    if (data.source === POOL_REBATE_SOURCES.AUTO) return await deleteAutoPoolRebate(ctx, data.txid)
     await ctx.globalDataLib.setGlobalData({ ts: data.ts, remove: true }, GLOBAL_DATA_TYPES.POOL_REBATES)
     if (data.txid) await deleteAutoPoolRebate(ctx, data.txid)
     return true
@@ -152,6 +153,11 @@ async function getFeatureConfig (ctx) {
   const featureConfig = ctx.conf.featureConfig || {}
   return {
     ...featureConfig,
+    // The pool account usernames are backend wiring; clients only need the
+    // ids, labels, groups and consumption source.
+    ...(Array.isArray(featureConfig.phases) && {
+      phases: featureConfig.phases.map(({ pool, ...rest }) => rest)
+    }),
     ...await getFeatures(ctx),
     lockedTimezone: featureConfig.lockedTimezone || LOCKED_TIMEZONE_DEFAULT
   }
