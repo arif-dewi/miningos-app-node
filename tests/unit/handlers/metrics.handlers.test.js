@@ -1121,6 +1121,53 @@ test('getHashrate - daily buckets are the site local days, bounded by start/end'
   t.is(result.summary.avgHashrateMhs, 125)
 })
 
+test('getHashrate - in a +05:30 zone the first local day starts at start, like consumption', async (t) => {
+  // Local midnight in Asia/Kolkata is 18:30Z, so the store's first hourly bucket is
+  // labelled 18:00Z - half an hour before `start`, in the previous local day.
+  const start = Date.UTC(2026, 9, 10, 18, 30)
+  const end = start + 2 * L_DAY - 1
+  const rows = []
+  for (let ts = start - L_HOUR / 2; ts <= end; ts += L_HOUR) rows.push({ ts, hashrate_mhs_5m_sum_aggr: 100 })
+  const ctx = localSiteCtx(rows)
+
+  const daily = await getHashrate(ctx, { query: { start, end, interval: '1d', timezone: 'Asia/Kolkata' } })
+
+  t.alike(daily.log.map(({ ts, timeRange }) => ({ ts, timeRange })), [
+    { ts: start, timeRange: { startTs: start, endTs: start + L_DAY - 1 } },
+    { ts: start + L_DAY, timeRange: { startTs: start + L_DAY, endTs: end } }
+  ], 'no empty bucket before the first local day')
+
+  const hourly = await getHashrate(ctx, { query: { start, end, interval: '1h', timezone: 'Asia/Kolkata' } })
+  t.is(hourly.log[0].ts, start, 'the straddling hour is clamped to start')
+})
+
+test('getHashrate - groupBy days are the site local days, bounded by start/end', async (t) => {
+  const captured = []
+  // 2026-10-06 00:00 local to 2026-10-12 23:59:59.999 local
+  const start = 1791259200000
+  const end = 1791863999999
+  const rows = []
+  for (let ts = start; ts <= end; ts += L_HOUR) {
+    // the first local day's hours alternate 100/300, so it averages 200
+    const first = ts < start + L_DAY
+    rows.push({ ts, hashrate_mhs_5m_type_group_sum_aggr: { 'miner-a': first ? (ts / L_HOUR % 2 ? 300 : 100) : 50 } })
+  }
+  // an hour with no group map is skipped, not counted as zero
+  rows.push({ ts: start + L_DAY / 2 + 1, hashrate_mhs_5m_type_group_sum_aggr: null })
+  const ctx = localSiteCtx(rows, { onRequest: (payload) => captured.push(payload) })
+
+  const result = await getHashrate(ctx, { query: { start, end, groupBy: 'miner' } })
+
+  t.is(captured[0].key, 'stat-30m')
+  t.is(captured[0].groupRange, '1H', 'rolled up from hourly buckets')
+  t.is(result.log.length, 7, 'one entry per local day')
+  t.is(result.log[0].ts, start, 'the first entry starts at the requested start')
+  t.alike(result.log[0].timeRange, { startTs: start, endTs: start + L_DAY - 1 })
+  t.alike(result.log[6].timeRange, { startTs: start + 6 * L_DAY, endTs: end }, 'the last entry ends at the requested end')
+  t.alike(result.log[0].hashrateMhs, { 'miner-a': 200 }, 'a group averages its hours')
+  t.alike(result.log[1].hashrateMhs, { 'miner-a': 50 })
+})
+
 test('getEfficiency - daily buckets are the site local days, bounded by start/end', async (t) => {
   const start = L_OCT1
   const end = L_OCT1 + 2 * L_DAY - 1
@@ -5699,6 +5746,37 @@ test('getHashrate - pool-only phase serves its accounts from hashrate-history', 
   t.is(res.log[0].poolHashrateMhs, res.log[0].hashrateMhs)
   t.is(res.log[0].nominalHashrateMhs, 5e7)
   t.is(res.summary.avgPoolHashrateMhs, 5e13 / 1e6)
+})
+
+test('getHashrate - pool-only phase buckets match the requested range, like consumption and efficiency', async (t) => {
+  // Local midnight in a +05:30 zone: on the UTC grid the first day started 5.5h before
+  // `start` and the last one ran 18.5h past `end`.
+  const start = Date.UTC(2026, 8, 30, 18, 30)
+  const end = start + 2 * 24 * PHASE_HOUR_MS - 1
+  const samples = [start + PHASE_HOUR_MS, start + 30 * PHASE_HOUR_MS].map((ts) => ({
+    ts, poolType: 'ocean', username: 'addr2', hashrate: 5e13
+  }))
+  const ctx = phaseCtx(async (key, method) => {
+    if (method === 'getWrkExtData') return [{ hashrateHistory: samples }]
+    return []
+  })
+
+  const daily = await getHashrate(ctx, {
+    query: { start, end, interval: '1d', timezone: 'Asia/Kolkata', phase: 'phase1_5' }
+  })
+
+  t.alike(daily.log.map(({ ts, timeRange }) => ({ ts, timeRange })), [
+    { ts: start, timeRange: { startTs: start, endTs: start + 24 * PHASE_HOUR_MS - 1 } },
+    { ts: start + 24 * PHASE_HOUR_MS, timeRange: { startTs: start + 24 * PHASE_HOUR_MS, endTs: end } }
+  ])
+
+  const hourly = await getHashrate(ctx, {
+    query: { start, end: start + 2 * PHASE_HOUR_MS - 1, interval: '1h', phase: 'phase1_5' }
+  })
+
+  t.alike(hourly.log.map(({ ts, timeRange }) => ({ ts, timeRange })), [
+    { ts: start + PHASE_HOUR_MS / 2, timeRange: { startTs: start + PHASE_HOUR_MS / 2, endTs: start + 1.5 * PHASE_HOUR_MS - 1 } }
+  ], 'whole hours inside the range, each carrying its timeRange')
 })
 
 test('getHashrate - pool overlay on a telemetry phase filters to its accounts', async (t) => {
