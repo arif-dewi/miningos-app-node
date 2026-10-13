@@ -112,13 +112,20 @@ function getPhaseNominals (globalConfigResults, phaseId) {
 }
 
 /**
- * Consumption series seam for phase-scoped endpoints. Until the manual
- * consumption store is wired in, every phase reads the site series, so
- * efficiency and revenue-summary stay correct for `total` and merely
- * un-split for the others. The consumption workstream swaps this body.
+ * How a phase's consumption is measured: `manual` reads the hourly entries
+ * logged on the DCS worker, `remainder` is a DCS meter (`meterKey`, a key of
+ * by_meter_power_w) minus those manual entries. A phase without a usable source
+ * fails loudly instead of falling back to the site series under its own tab.
  */
-async function getPhaseConsumption (ctx, req, phase, fetchSiteConsumption) {
-  return fetchSiteConsumption(ctx, req)
+function getPhaseConsumptionSource (phase) {
+  const source = phase?.consumption?.source
+  if (source === CONSUMPTION_SOURCES.MANUAL) return { source }
+  if (source === CONSUMPTION_SOURCES.REMAINDER) {
+    const meterKey = phase.consumption.meterKey
+    if (typeof meterKey !== 'string' || !meterKey) throw new Error('ERR_PHASE_CONSUMPTION_UNCONFIGURED')
+    return { source, meterKey }
+  }
+  throw new Error('ERR_PHASE_CONSUMPTION_UNCONFIGURED')
 }
 
 module.exports = {
@@ -132,5 +139,5 @@ module.exports = {
   hasMinerTelemetry,
   getPoolOnlyPhases,
   getPhaseNominals,
-  getPhaseConsumption
+  getPhaseConsumptionSource
 }

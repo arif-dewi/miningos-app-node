@@ -551,13 +551,14 @@ test('getRevenueSummary flags the range when a payout had no recorded price', as
   t.is(result.summary.missingPriceBuckets, 1)
 })
 
-test('getRevenueSummary - phase rows withhold the site-power ratios until consumption splits', async (t) => {
+test('getRevenueSummary - phase rows divide the phase consumption by the phase nominal', async (t) => {
   // Unique month so the daily-series month cache cannot leak across tests.
-  const dayTs = Date.UTC(2031, 5, 15)
+  const dayTs = Date.UTC(2019, 5, 15)
   const ctx = withDataProxy({
     conf: {
       orks: [{ rpcPublicKey: 'key1' }],
       featureConfig: {
+        centralDCSSetup: { enabled: true },
         phases: [{
           id: 'phase1_5',
           label: 'Phase 1.5',
@@ -569,6 +570,10 @@ test('getRevenueSummary - phase rows withhold the site-power ratios until consum
     },
     net_r0: {
       jRequest: async (_key, method, payload) => {
+        if (method === 'getHistoricalLogs') {
+          // 0.6 MWh logged for every hour of the day: a steady 0.6 MW
+          return Array.from({ length: 24 }, (_, h) => ({ ts: dayTs + h * 3600000, totalConsumptionMWh: 0.6 }))
+        }
         if (method === 'tailLog') {
           return [{ ts: dayTs, site_power_w: 10_000_000, hashrate_mhs_5m_sum_aggr: 1e9 }]
         }
@@ -607,11 +612,13 @@ test('getRevenueSummary - phase rows withhold the site-power ratios until consum
   const phased = await getRevenueSummary(ctx, { query: { ...query, phase: 'phase1_5' } }, {})
   const phaseRow = phased.log.find(e => e.revenueBTC > 0)
   t.is(phaseRow.revenueBTC, 0.5, 'phase row carries only its account')
-  t.is(phaseRow.powerUtilization, null, 'site MW over the phase nominal is withheld')
-  t.is(phaseRow.downtimeMWh, null, 'so is the downtime energy derived from it')
+  t.is(phaseRow.powerW, 600000, 'power comes from the manual entries, not the site meter')
+  t.is(phaseRow.powerUtilization, 0.5, 'phase MW over the phase nominal')
+  t.ok(Math.abs(phaseRow.downtimeMWh - (1.2 - 0.6) * 24) < 1e-9, 'downtime against the phase nominal')
 
   const total = await getRevenueSummary(ctx, { query }, {})
   const totalRow = total.log.find(e => e.revenueBTC > 0)
+  t.is(totalRow.powerW, 10_000_000, 'the site row is not served the phase series from cache')
   t.ok(totalRow.powerUtilization > 0, 'site rows keep the ratio')
   t.ok(Number.isFinite(totalRow.downtimeMWh), 'and the downtime energy')
 })

@@ -5824,14 +5824,25 @@ test('getPoolHashrate - phase filters stats to the phase accounts', async (t) =>
   t.is(site.log[0].stats[0].hashrate, 6e14 + 5e13, 'site view sums the per-account averages')
 })
 
-test('getEfficiency - pool-only phase divides site power by the phase pool hashrate', async (t) => {
-  const ctx = phaseCtx(async (key, method, payload) => {
-    if (method === 'tailLog') {
-      return [{ ts: PHASE_START, site_power_w: 870000 }]
-    }
+const PHASE_DCS_FEATURE = {
+  ...PHASES_FEATURE,
+  centralDCSSetup: { enabled: true },
+  phases: PHASES_FEATURE.phases.map(p => p.id === 'phase1' ? { ...p, consumption: { source: 'remainder', meterKey: 'CCM' } } : p)
+}
+
+// Serves the DCS meter rollup and the manual consumption log for the phase tests.
+function phaseConsumptionCtx ({ meter = [], manual = [], hashrate = [], historicalLogs, onCall } = {}) {
+  return phaseCtx(async (key, method, payload) => {
+    if (onCall) onCall(method, payload)
+    if (method === 'getHistoricalLogs') return historicalLogs ? historicalLogs(payload) : manual
+    if (method === 'tailLog') return payload.type === 'miner' ? hashrate : meter
     if (method === 'getWrkExtData') return [{ hashrateHistory: phaseHistorySamples() }]
     return []
-  })
+  }, PHASE_DCS_FEATURE)
+}
+
+test('getEfficiency - pool-only phase divides its manual consumption by its pool hashrate', async (t) => {
+  const ctx = phaseConsumptionCtx({ manual: [{ ts: PHASE_START, totalConsumptionMWh: 0.87 }] })
 
   const res = await getEfficiency(ctx, {
     query: { start: PHASE_START, end: PHASE_START + PHASE_HOUR_MS - 1, interval: '1h', phase: 'phase1_5' }
@@ -5840,17 +5851,131 @@ test('getEfficiency - pool-only phase divides site power by the phase pool hashr
   const expectedThs = (5e13 / 1e6) / 1e6
   t.is(res.log.length, 1)
   t.is(res.log[0].efficiencyWThs, 870000 / expectedThs)
+  t.is(res.summary.missingHours, 0)
 })
 
-test('getConsumption/getDowntime - non-total phase is rejected until supported', async (t) => {
+test('getEfficiency - telemetry phase divides ccm minus manual by the fleet hashrate', async (t) => {
+  const H = PHASE_HOUR_MS
+  const ctx = phaseConsumptionCtx({
+    meter: [
+      { ts: PHASE_START, by_meter_power_w: { ccm: 5000000, 'site-pm': 9000000 } },
+      { ts: PHASE_START + H, by_meter_power_w: { ccm: 4000000 } },
+      { ts: PHASE_START + 2 * H, by_meter_power_w: { ccm: 4000000 } }
+    ],
+    manual: [
+      { ts: PHASE_START, totalConsumptionMWh: 1 },
+      { ts: PHASE_START + H, totalConsumptionMWh: 1 },
+      { ts: PHASE_START + 2 * H, totalConsumptionMWh: 1 }
+    ],
+    // 100 TH/s and 200 TH/s; the third hour has no hashrate sample
+    hashrate: [
+      { ts: `${PHASE_START}-${PHASE_START + H - 1}`, hashrate_mhs_5m_sum_aggr: 1e8 },
+      { ts: `${PHASE_START + H}-${PHASE_START + 2 * H - 1}`, hashrate_mhs_5m_sum_aggr: 2e8 }
+    ]
+  })
+  const query = { start: PHASE_START, end: PHASE_START + 3 * H - 1, phase: 'phase1' }
+
+  const hourly = await getEfficiency(ctx, { query: { ...query, interval: '1h' } })
+  t.alike(hourly.log.map(e => e.efficiencyWThs), [4000000 / 100, 3000000 / 200], '(ccm - manual) W over fleet TH/s')
+  t.is(hourly.summary.missingHours, 1, 'the hour without hashrate is surfaced')
+
+  const daily = await getEfficiency(ctx, { query: { ...query, interval: '1d' } })
+  t.is(daily.log.length, 1)
+  t.is(daily.log[0].efficiencyWThs, 3500000 / 150, 'mean power over mean hashrate, like the site series')
+})
+
+test('getConsumption - manual phase reads the logged hours and rolls them up', async (t) => {
+  const calls = []
+  const ctx = phaseConsumptionCtx({
+    manual: [
+      { ts: PHASE_START, totalConsumptionMWh: 1.2, cduConsumptionMWh: 0.1 },
+      { ts: PHASE_START + PHASE_HOUR_MS, totalConsumptionMWh: 0.8 }
+    ],
+    onCall: (method, payload) => calls.push({ method, payload })
+  })
+  const query = { start: PHASE_START, end: PHASE_START + 2 * PHASE_HOUR_MS - 1, phase: 'phase1_5' }
+
+  const hourly = await getConsumption(ctx, { query: { ...query, interval: '1h' } })
+  t.alike(hourly.log.map(e => e.consumptionMWh), [1.2, 0.8])
+  t.alike(hourly.log.map(e => e.powerW), [1200000, 800000], 'an hour of MWh is its average power')
+  t.ok(calls.every(c => c.method === 'getHistoricalLogs'), 'no meter is read for a manual phase')
+  t.is(calls[0].payload.logType, 'consumption')
+
+  const daily = await getConsumption(ctx, { query: { ...query, interval: '1d' } })
+  t.is(daily.log.length, 1)
+  t.is(daily.log[0].consumptionMWh, 2)
+  t.is(daily.log[0].powerW, 1000000)
+  t.is(daily.summary.totalConsumptionMWh, 2)
+  t.is(daily.summary.missingHours, 0)
+})
+
+test('getConsumption - remainder phase is its meter minus the manual hours', async (t) => {
+  const ctx = phaseConsumptionCtx({
+    meter: [
+      { ts: PHASE_START, by_meter_power_w: { ccm: 5000000, 'site-pm': 9000000 } },
+      { ts: PHASE_START + PHASE_HOUR_MS, by_meter_power_w: { ccm: 4000000 } }
+    ],
+    manual: [
+      { ts: PHASE_START, totalConsumptionMWh: 1.5 },
+      { ts: PHASE_START + PHASE_HOUR_MS, totalConsumptionMWh: 1 }
+    ]
+  })
+
+  const res = await getConsumption(ctx, {
+    query: { start: PHASE_START, end: PHASE_START + 2 * PHASE_HOUR_MS - 1, interval: '1h', phase: 'phase1' }
+  })
+
+  t.alike(res.log.map(e => e.consumptionMWh), [3.5, 3], 'configured CCM matches the ccm meter key')
+  t.is(res.summary.totalConsumptionMWh, 6.5)
+})
+
+test('getConsumption - an hour without a manual entry is missing, not zero', async (t) => {
+  const ctx = phaseConsumptionCtx({
+    meter: [
+      { ts: PHASE_START, by_meter_power_w: { ccm: 5000000 } },
+      { ts: PHASE_START + PHASE_HOUR_MS, by_meter_power_w: { ccm: 5000000 } }
+    ],
+    manual: [
+      { ts: PHASE_START, totalConsumptionMWh: 1 },
+      { ts: PHASE_START + PHASE_HOUR_MS, totalConsumptionMWh: null }
+    ]
+  })
+  const query = { start: PHASE_START, end: PHASE_START + 2 * PHASE_HOUR_MS - 1, interval: '1d' }
+
+  const remainder = await getConsumption(ctx, { query: { ...query, phase: 'phase1' } })
+  t.is(remainder.log[0].consumptionMWh, 4, 'the unlogged hour is not counted as the full meter')
+  t.is(remainder.log[0].powerW, 4000000, 'nor averaged in as zero')
+  t.is(remainder.summary.missingHours, 1)
+
+  const manual = await getConsumption(ctx, { query: { ...query, phase: 'phase1_5' } })
+  t.is(manual.summary.totalConsumptionMWh, 1)
+  t.is(manual.summary.missingHours, 1)
+})
+
+test('getConsumption - phase rejects groupBy, byMeter and racks, and needs a usable source', async (t) => {
+  const ctx = phaseConsumptionCtx()
+  const query = { start: PHASE_START, end: PHASE_START + PHASE_HOUR_MS, phase: 'phase1_5' }
+
+  await t.exception(() => getConsumption(ctx, { query: { ...query, groupBy: 'miner' } }), /ERR_PHASE_NOT_SUPPORTED/)
+  await t.exception(() => getConsumption(ctx, { query: { ...query, byMeter: true } }), /ERR_PHASE_NOT_SUPPORTED/)
+  await t.exception(() => getConsumption(ctx, { query: { ...query, racks: 'r1' } }), /ERR_PHASE_NOT_SUPPORTED/)
+  await t.exception(() => getConsumption(ctx, { query: { ...query, phase: 'nope' } }), /ERR_PHASE_INVALID/)
+
+  // PHASES_FEATURE's remainder phase has no meterKey, and no central DCS
+  const unconfigured = phaseCtx(async () => [])
+  await t.exception(() => getConsumption(unconfigured, { query: { ...query, phase: 'phase1' } }), /ERR_PHASE_CONSUMPTION_UNCONFIGURED/)
+  await t.exception(() => getConsumption(unconfigured, { query }), /ERR_PHASE_CONSUMPTION_REQUIRES_CENTRAL_DCS/)
+})
+
+test('getConsumption/getDowntime - total stays the site view, downtime still rejects a phase', async (t) => {
   const ctx = phaseCtx(async () => [])
   const query = { start: PHASE_START, end: PHASE_START + PHASE_HOUR_MS, phase: 'phase1_5' }
 
-  await t.exception(() => getConsumption(ctx, { query }), /ERR_PHASE_NOT_SUPPORTED/)
   await t.exception(() => getDowntime(ctx, { query: { ...query, interval: '1h' } }), /ERR_PHASE_NOT_SUPPORTED/)
 
   const total = await getConsumption(ctx, { query: { ...query, phase: 'total' } })
   t.ok(total.log, 'phase=total passes through as the site view')
+  t.is(total.summary.missingHours, undefined, 'the site summary shape is unchanged')
 })
 
 test('getHashrate - synthetic group never overwrites a colliding telemetry key', async (t) => {
