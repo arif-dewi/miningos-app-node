@@ -1141,6 +1141,33 @@ test('getHashrate - in a +05:30 zone the first local day starts at start, like c
   t.is(hourly.log[0].ts, start, 'the straddling hour is clamped to start')
 })
 
+test('getHashrate - groupBy days are the site local days, bounded by start/end', async (t) => {
+  const captured = []
+  // 2026-10-06 00:00 local to 2026-10-12 23:59:59.999 local
+  const start = 1791259200000
+  const end = 1791863999999
+  const rows = []
+  for (let ts = start; ts <= end; ts += L_HOUR) {
+    // the first local day's hours alternate 100/300, so it averages 200
+    const first = ts < start + L_DAY
+    rows.push({ ts, hashrate_mhs_5m_type_group_sum_aggr: { 'miner-a': first ? (ts / L_HOUR % 2 ? 300 : 100) : 50 } })
+  }
+  // an hour with no group map is skipped, not counted as zero
+  rows.push({ ts: start + L_DAY / 2 + 1, hashrate_mhs_5m_type_group_sum_aggr: null })
+  const ctx = localSiteCtx(rows, { onRequest: (payload) => captured.push(payload) })
+
+  const result = await getHashrate(ctx, { query: { start, end, groupBy: 'miner' } })
+
+  t.is(captured[0].key, 'stat-30m')
+  t.is(captured[0].groupRange, '1H', 'rolled up from hourly buckets')
+  t.is(result.log.length, 7, 'one entry per local day')
+  t.is(result.log[0].ts, start, 'the first entry starts at the requested start')
+  t.alike(result.log[0].timeRange, { startTs: start, endTs: start + L_DAY - 1 })
+  t.alike(result.log[6].timeRange, { startTs: start + 6 * L_DAY, endTs: end }, 'the last entry ends at the requested end')
+  t.alike(result.log[0].hashrateMhs, { 'miner-a': 200 }, 'a group averages its hours')
+  t.alike(result.log[1].hashrateMhs, { 'miner-a': 50 })
+})
+
 test('getEfficiency - daily buckets are the site local days, bounded by start/end', async (t) => {
   const start = L_OCT1
   const end = L_OCT1 + 2 * L_DAY - 1

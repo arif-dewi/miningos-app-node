@@ -122,8 +122,8 @@ const monthlyHashesCache = createMonthlyHashesCache()
 
 // A calendar month is rolled up from hourly buckets, so it is only offered for the
 // series that HAS hourly buckets: the site-wide one, optionally scoped to a container.
-// A grouped or rack-scoped request is served off the daily grouped log instead, where
-// there is no per-hour pool pairing to roll up and an "hours reported" count would lie.
+// A grouped or rack-scoped request gets its local months from getGoupedHashrate instead,
+// where there is no per-hour pool pairing to roll up and an "hours reported" count would lie.
 function wantsMonthlyRollup (req) {
   return req.query.interval === '1M' && !req.query.groupBy && !hasRackFilter(req)
 }
@@ -238,7 +238,7 @@ async function resolveHashrate (ctx, req, phase = null) {
 
   if (hasRackFilter(req)) {
     const { log } = await getGoupedHashrate(ctx, rackGroupedReq(req))
-    const scoped = log.map(({ ts, hashrateMhs }) => ({ ts, hashrateMhs: sumObjectValues(hashrateMhs) }))
+    const scoped = log.map(({ ts, timeRange, hashrateMhs }) => ({ ts, ...(timeRange && { timeRange }), hashrateMhs: sumObjectValues(hashrateMhs) }))
     return { log: scoped, summary: calculateHashrateSummary(scoped) }
   }
 
@@ -474,7 +474,11 @@ async function injectSyntheticHashrateGroups (ctx, req, log) {
 
   const { start, end } = req.query
   const dayMs = 24 * 60 * 60 * 1_000
-  const buckets = log.map((entry) => ({ ts: entry.ts, startTs: entry.ts, endTs: entry.ts + dayMs - 1 }))
+  const buckets = log.map((entry) => ({
+    ts: entry.ts,
+    startTs: entry.timeRange?.startTs ?? entry.ts,
+    endTs: entry.timeRange?.endTs ?? entry.ts + dayMs - 1
+  }))
 
   for (const phase of phases) {
     const key = groupBy === 'miner' ? phase.groups?.minerType : phase.groups?.container
@@ -503,14 +507,21 @@ const HASHRATE_GROUP_FIELDS = {
 }
 
 async function getGoupedHashrate (ctx, req) {
-  const { groupBy, start, end } = req.query
+  const { groupBy } = req.query
+  const { start, end } = validateStartEnd(req)
 
   const { field, aggrField } = HASHRATE_GROUP_FIELDS[groupBy]
+
+  // Days, weeks and months are cut in the site's zone from hourly buckets, as the
+  // ungrouped series is: stat-1d sits on UTC midnights, so for a site off UTC its first
+  // day fell before `start` and was dropped, and every row was a UTC day.
+  const interval = resolveInterval(start, end, req.query.interval)
+  const local = isLocalInterval(interval)
 
   const res = await ctx.dataProxy.requestData(RPC_METHODS.TAIL_LOG, {
     type: WORKER_TYPES.MINER,
     tag: WORKER_TAGS.MINER,
-    key: LOG_KEYS.STAT_1D,
+    ...(local ? { ...getIntervalConfig('1h'), shouldCalculateAvg: true } : { key: LOG_KEYS.STAT_1D }),
     start,
     end,
     fields: { [field]: 1 },
@@ -519,14 +530,18 @@ async function getGoupedHashrate (ctx, req) {
 
   const rackFilter = groupBy === 'rack' ? rackFilterFor(parseRacks(req)) : null
 
-  const log = res[0].reduce((aggr, val) => {
+  const entries = firstOrkEntries(res).map((val) => {
     let hashrateMhs = val[aggrField]
     if (rackFilter && hashrateMhs && typeof hashrateMhs === 'object') {
       hashrateMhs = Object.fromEntries(Object.entries(hashrateMhs).filter(([rack]) => rackFilter(rack)))
     }
-    aggr.push({ ts: parseEntryTs(val.ts), hashrateMhs })
-    return aggr
-  }, [])
+    // An hour straddling `start` (zones off the whole hour) belongs to the range's first day.
+    return { ts: local ? Math.max(start, parseEntryTs(val.ts)) : parseEntryTs(val.ts), hashrateMhs }
+  })
+
+  const log = local
+    ? rollupLocalGroupedHashrate(entries, { interval, timezone: resolveTimezone(ctx, req), start, end })
+    : entries
 
   await injectSyntheticHashrateGroups(ctx, req, log)
 
@@ -554,6 +569,21 @@ function calculateHashrateSummary (log, withNominal = false) {
   summary.avgPctOfNominal = avgNominal ? (summary.avgHashrateMhs / avgNominal) * 100 : null
 
   return summary
+}
+
+// Each group averages the hours it reported in, as the store averaged its samples; an
+// hour without a group map (no data) is skipped rather than counted as zero.
+function rollupLocalGroupedHashrate (hourly, bucketing) {
+  return groupLocalBuckets(hourly, bucketing).map(({ ts, timeRange, entries }) => {
+    let counts = null
+    let total = null
+    for (const { hashrateMhs } of entries) {
+      if (!hashrateMhs || typeof hashrateMhs !== 'object') continue
+      counts = addBucketCounts(counts, hashrateMhs)
+      total = addBucketValues(total, hashrateMhs)
+    }
+    return { ts, timeRange, hashrateMhs: total ? averageBucketValues(total, counts) : null }
+  })
 }
 
 function calculateGroupedHashrateSummary (log, groupBy) {
