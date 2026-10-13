@@ -323,6 +323,16 @@ test('getEnergyConsumption - reads the DCS consumption log, dedups by ts and sor
   t.is(result[1].cduConsumptionMWh, 5, 'latest updatedAt wins')
 })
 
+test('getEnergyConsumption - keeps null values as null and zeros as zeros', async (t) => {
+  const ctx = consumptionCtx({
+    jRequest: async () => [{ ts: CONS_H0, totalConsumptionMWh: 10, cduConsumptionMWh: null, rectifier1ConsumptionMWh: 0, updatedAt: 1 }]
+  })
+  const [row] = await getEnergyConsumption(ctx, { query: { start: CONS_H0, end: CONS_H0 } })
+  t.is(row.cduConsumptionMWh, null, 'a cleared value is returned as null')
+  t.is(row.rectifier1ConsumptionMWh, 0)
+  t.ok('cduConsumptionMWh' in row)
+})
+
 test('getEnergyConsumption - throws when every ork fails', async (t) => {
   const ctx = consumptionCtx({ jRequest: async () => { throw new Error('boom') } })
   await t.exception(() => getEnergyConsumption(ctx, { query: { start: 0, end: 1 } }))
@@ -348,6 +358,20 @@ test('saveEnergyConsumption - sends only the entries to the DCS worker, aligned 
     type: WORKER_TYPES.DCS,
     entries
   })
+})
+
+test('saveEnergyConsumption - forwards partial entries, zeros and nulls untouched', async (t) => {
+  let captured = null
+  const ctx = consumptionCtx({
+    jRequest: async (key, method, payload) => { captured = payload; return [{ upserted: payload.entries.length }] }
+  })
+  const entries = [
+    { ts: CONS_H0, cduConsumptionMWh: 0 },
+    { ts: CONS_H0 + CONS_HOUR, totalConsumptionMWh: null, rectifier1ConsumptionMWh: 2.5 }
+  ]
+
+  t.alike(await saveEnergyConsumption(ctx, saveReq(entries)), { success: true, upserted: 2 })
+  t.alike(captured.entries, entries, 'merge/clear semantics are the worker\'s: nothing is filled in or dropped here')
 })
 
 test('saveEnergyConsumption - rejects hours off the site grid before any rpc', async (t) => {

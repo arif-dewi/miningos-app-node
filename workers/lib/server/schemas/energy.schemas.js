@@ -5,7 +5,8 @@ const { CONSUMPTION_FIELDS } = require('../../constants')
 // At most a month of hours (31 days x 24) per request.
 const MAX_CONSUMPTION_ENTRIES = 744
 
-const consumptionValue = { type: 'number', minimum: 0 }
+// A number >= 0 (zero is a real reading) replaces the stored value; null clears it (stored and returned as null).
+const consumptionValue = { type: ['number', 'null'], minimum: 0 }
 
 const schemas = {
   query: {
@@ -33,7 +34,9 @@ const schemas = {
               ts: { type: 'integer', minimum: 0 },
               ...Object.fromEntries(CONSUMPTION_FIELDS.map(field => [field, consumptionValue]))
             },
-            required: ['ts', ...CONSUMPTION_FIELDS],
+            required: ['ts'],
+            // an entry must pass at least one value; values it omits are left as stored
+            anyOf: CONSUMPTION_FIELDS.map(field => ({ required: [field] })),
             additionalProperties: false
           }
         }

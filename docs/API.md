@@ -1147,7 +1147,7 @@ Hourly consumption is stored on the DCS worker, one record per local hour of the
 
 **Get hourly consumption records for a time range**
 
-**Auth Required:** Yes (`electricity:r`)  
+**Auth Required:** Yes (`powermeter:r`)  
 **Query Parameters:**
 
 | Parameter | Type | Required | Description |
@@ -1162,7 +1162,7 @@ curl -H "Authorization:Bearer TOKEN" \
   "http://localhost:3000/auth/energy/consumption?start=1767236400000&end=1767243600000"
 ```
 
-**Response:** records ascending by `ts`; hours with nothing stored are absent.
+**Response:** records ascending by `ts`. Hours with nothing stored are absent. Within a record, a value that was cleared is `null` and a value that was never set is missing; both mean unknown, which is different from `0`.
 ```json
 [
   {
@@ -1182,19 +1182,27 @@ curl -H "Authorization:Bearer TOKEN" \
 
 **Create or update hourly consumption records**
 
-Each entry replaces whatever is stored for its hour. There is no delete: to clear an hour, save it with all four values set to `0`. The whole request is rejected if any entry is invalid.
+Each entry only changes the values it passes, so an entry can never wipe the rest of its hour:
 
-**Auth Required:** Yes (`electricity:rw`)  
+- a number replaces that value, and `0` is a real value;
+- `null` clears that value: it is stored and returned as `null` (absent/unknown);
+- a value that is left out is kept exactly as stored.
+
+An hour whose values are all `null` keeps its record. For an hour with no record yet, only the values passed are stored, and an entry that passes only `null`s creates no record. There is no delete endpoint: use `null` to clear values. The whole request is rejected if any entry is invalid, and nothing is applied.
+
+**Auth Required:** Yes (`powermeter:rw`)  
 **Body:**
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `entries` | array | Yes | 1 to 744 entries |
 | `entries[].ts` | integer | Yes | Start of a local hour in the site zone (UTC ms) |
-| `entries[].totalConsumptionMWh` | number ≥ 0 | Yes | Total consumption for the hour |
-| `entries[].cduConsumptionMWh` | number ≥ 0 | Yes | CDU consumption |
-| `entries[].rectifier1ConsumptionMWh` | number ≥ 0 | Yes | Rectifier 1 consumption |
-| `entries[].rectifier2ConsumptionMWh` | number ≥ 0 | Yes | Rectifier 2 consumption |
+| `entries[].totalConsumptionMWh` | number ≥ 0 or `null` | At least one of these four | Total consumption for the hour |
+| `entries[].cduConsumptionMWh` | number ≥ 0 or `null` | ↑ | CDU consumption |
+| `entries[].rectifier1ConsumptionMWh` | number ≥ 0 or `null` | ↑ | Rectifier 1 consumption |
+| `entries[].rectifier2ConsumptionMWh` | number ≥ 0 or `null` | ↑ | Rectifier 2 consumption |
+
+`ts` and the values must be real JSON numbers (or `null`): strings and booleans are rejected rather than converted, so a stray `""` or `false` cannot clear or zero a value.
 
 **Example:**
 ```bash
@@ -1203,7 +1211,14 @@ curl -X POST -H "Authorization:Bearer TOKEN" -H "Content-Type: application/json"
   "http://localhost:3000/auth/energy/consumption"
 ```
 
-**Response:**
+To correct one value, set another to zero and clear a third, leaving the rest of the hour as stored:
+```bash
+curl -X POST -H "Authorization:Bearer TOKEN" -H "Content-Type: application/json" \
+  -d '{"entries":[{"ts":1767236400000,"cduConsumptionMWh":0,"rectifier2ConsumptionMWh":null}]}' \
+  "http://localhost:3000/auth/energy/consumption"
+```
+
+**Response:** `upserted` is the number of entries applied.
 ```json
 { "success": true, "upserted": 1 }
 ```
@@ -1214,5 +1229,7 @@ curl -X POST -H "Authorization:Bearer TOKEN" -H "Content-Type: application/json"
 |---------|-------|
 | `ERR_TS_NOT_HOUR_ALIGNED` | A `ts` is not the start of a local hour in the site zone |
 | `ERR_TS_DUPLICATE` | The same `ts` appears twice in `entries` |
+| `ERR_TS_INVALID` | A `ts` is not a number |
+| `ERR_CONSUMPTION_INVALID` | A value is not a number or `null` |
 | `ERR_CONSUMPTION_SAVE_FAILED` | No DCS worker confirmed the write (worker unreachable or not yet upgraded) |
 | `ERR_TIMEZONE_UNSUPPORTED` | A `timezone` query parameter was sent |

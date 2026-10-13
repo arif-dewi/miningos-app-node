@@ -134,28 +134,71 @@ test('energy routes - consumption GET and POST require the powermeter permission
   t.is(AUTH_PERMISSIONS.POWERMETER, 'powermeter', 'permission key is powermeter')
 })
 
-test('energy routes - energyConsumption schema validates entries', (t) => {
+test('energy routes - energyConsumption schema validates partial entries', (t) => {
   const Ajv = require('ajv')
   const schemas = require('../../../workers/lib/server/schemas/energy.schemas')
   const validate = new Ajv().compile(schemas.body.energyConsumption)
   const validateQuery = new Ajv({ coerceTypes: true }).compile(schemas.query.energyConsumption)
-  const entry = { ts: 1767225600000, totalConsumptionMWh: 10, cduConsumptionMWh: 1, rectifier1ConsumptionMWh: 4, rectifier2ConsumptionMWh: 4 }
+  const TS = 1767225600000
+  const FIELDS = ['totalConsumptionMWh', 'cduConsumptionMWh', 'rectifier1ConsumptionMWh', 'rectifier2ConsumptionMWh']
+  const full = { ts: TS, totalConsumptionMWh: 10, cduConsumptionMWh: 1, rectifier1ConsumptionMWh: 4, rectifier2ConsumptionMWh: 4 }
 
-  t.ok(validate({ entries: [entry] }), 'accepts a full entry')
-  t.ok(validate({ entries: [{ ...entry, totalConsumptionMWh: 0, cduConsumptionMWh: 0, rectifier1ConsumptionMWh: 0, rectifier2ConsumptionMWh: 0 }] }), 'accepts zeros (how an hour is cleared)')
+  t.ok(validate({ entries: [full] }), 'accepts a full entry')
+  for (const field of FIELDS) {
+    t.ok(validate({ entries: [{ ts: TS, [field]: 3 }] }), `accepts ${field} alone`)
+    t.ok(validate({ entries: [{ ts: TS, [field]: 0 }] }), `accepts a zero ${field}`)
+    t.ok(validate({ entries: [{ ts: TS, [field]: null }] }), `accepts null ${field} (clears the value)`)
+    t.absent(validate({ entries: [{ ts: TS, [field]: -1 }] }), `rejects negative ${field}`)
+    t.absent(validate({ entries: [{ ts: TS, [field]: 'x' }] }), `rejects non-numeric ${field}`)
+  }
+  t.ok(validate({ entries: [{ ts: TS, totalConsumptionMWh: null, cduConsumptionMWh: 2, rectifier1ConsumptionMWh: 0 }] }), 'accepts mixed numbers, zeros and nulls')
+  t.absent(validate({ entries: [{ ts: TS }] }), 'rejects an entry that passes no value')
+  t.absent(validate({ entries: [{ cduConsumptionMWh: 1 }] }), 'rejects an entry without ts')
+  t.absent(validate({ entries: [{ ts: 1.5, cduConsumptionMWh: 1 }] }), 'rejects non-integer ts')
+  t.absent(validate({ entries: [{ ...full, note: 'x' }] }), 'rejects unknown fields')
   t.absent(validate({ entries: [] }), 'rejects empty entries')
   t.absent(validate({}), 'rejects missing entries')
-  t.absent(validate({ entries: new Array(745).fill(entry) }), 'rejects more than a month of hours')
-  for (const field of ['ts', 'totalConsumptionMWh', 'cduConsumptionMWh', 'rectifier1ConsumptionMWh', 'rectifier2ConsumptionMWh']) {
-    const { [field]: _, ...missing } = entry
-    t.absent(validate({ entries: [missing] }), `rejects missing ${field}`)
-  }
-  t.absent(validate({ entries: [{ ...entry, cduConsumptionMWh: -1 }] }), 'rejects negative values')
-  t.absent(validate({ entries: [{ ...entry, ts: 1.5 }] }), 'rejects non-integer ts')
-  t.absent(validate({ entries: [{ ...entry, note: 'x' }] }), 'rejects unknown fields')
+  t.absent(validate({ entries: new Array(745).fill(full) }), 'rejects more than a month of hours')
 
   t.ok(validateQuery({ start: '0', end: '3600000' }), 'query coerces start/end')
   t.absent(validateQuery({ start: 0 }), 'query requires end')
+})
+
+test('energy routes - consumption POST rejects values Fastify would coerce', async (t) => {
+  const Fastify = require('fastify')
+  const route = createRoutesForTest(ROUTES_PATH)
+    .find(r => r.url === ENDPOINTS.ENERGY_CONSUMPTION && r.method === HTTP_METHODS.POST)
+  const app = Fastify()
+  app.setErrorHandler((err, req, rep) => rep.code(400).send({ message: err.message }))
+  app.post('/x', { schema: route.schema, preValidation: route.preValidation }, async (req) => req.body)
+  t.teardown(() => app.close())
+
+  const send = (entry) => app.inject({ method: 'POST', url: '/x', payload: { entries: [entry] } })
+  const TS = 3600000
+
+  // sanity: without the hook these are silently coerced (the reason it exists)
+  const plain = Fastify()
+  plain.post('/x', { schema: route.schema }, async (req) => req.body)
+  t.teardown(() => plain.close())
+  const coerced = await plain.inject({ method: 'POST', url: '/x', payload: { entries: [{ ts: TS, cduConsumptionMWh: '' }] } })
+  t.is(coerced.json().entries[0].cduConsumptionMWh, null, 'an empty string would otherwise become null, i.e. clear a value')
+
+  for (const bad of ['', '7', false, true, [], {}]) {
+    const res = await send({ ts: TS, cduConsumptionMWh: bad })
+    t.is(res.statusCode, 400, `cdu=${JSON.stringify(bad)} rejected`)
+    t.is(res.json().message, 'ERR_CONSUMPTION_INVALID')
+  }
+  for (const bad of ['3600000', false]) {
+    const res = await send({ ts: bad, cduConsumptionMWh: 1 })
+    t.is(res.statusCode, 400, `ts=${JSON.stringify(bad)} rejected`)
+    t.is(res.json().message, 'ERR_TS_INVALID')
+  }
+
+  for (const good of [null, 0, 5.5]) {
+    const res = await send({ ts: TS, cduConsumptionMWh: good })
+    t.is(res.statusCode, 200, `cdu=${JSON.stringify(good)} accepted`)
+    t.is(res.json().entries[0].cduConsumptionMWh, good, 'passed through unchanged')
+  }
 })
 
 test('energy routes - handler functions', (t) => {

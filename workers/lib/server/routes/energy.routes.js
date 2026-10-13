@@ -1,9 +1,27 @@
 'use strict'
 
-const { ENDPOINTS, HTTP_METHODS, AUTH_PERMISSIONS } = require('../../constants')
+const { ENDPOINTS, HTTP_METHODS, AUTH_PERMISSIONS, CONSUMPTION_FIELDS } = require('../../constants')
 const { getEnergyConsumption, saveEnergyConsumption, getEnergyForecast, setAvailableEnergy, getEnergyForecastHistory, setForecastSettings, getForecastSettings, setForecastOverride, setAvailableEnergyHistory, setForecastOverrideHistory } = require('../handlers/energy.handlers')
 const { createCachedAuthRoute, createAuthRoute, rejectTimezone } = require('../lib/routeHelpers')
 const schemas = require('../schemas/energy.schemas')
+
+// Fastify coerces body types by default ("" -> null, false -> 0, "7" -> 7). Here that
+// would silently clear or zero a stored value, so the raw body is checked before
+// validation: ts and every value must be real JSON numbers (values may also be null).
+const requireStrictConsumptionBody = (req, rep, done) => {
+  const entries = req.body?.entries
+  if (Array.isArray(entries)) {
+    for (const entry of entries) {
+      if (!entry || typeof entry !== 'object') continue // the schema rejects these
+      if (entry.ts !== undefined && typeof entry.ts !== 'number') return done(new Error('ERR_TS_INVALID'))
+      for (const field of CONSUMPTION_FIELDS) {
+        const val = entry[field]
+        if (val !== undefined && val !== null && typeof val !== 'number') return done(new Error('ERR_CONSUMPTION_INVALID'))
+      }
+    }
+  }
+  done()
+}
 
 module.exports = (ctx) => [
   {
@@ -118,7 +136,7 @@ module.exports = (ctx) => [
   {
     method: HTTP_METHODS.POST,
     url: ENDPOINTS.ENERGY_CONSUMPTION,
-    preValidation: rejectTimezone(),
+    preValidation: [rejectTimezone(), requireStrictConsumptionBody],
     ...createAuthRoute(ctx, saveEnergyConsumption, [AUTH_PERMISSIONS.POWERMETER]),
     schema: {
       body: schemas.body.energyConsumption

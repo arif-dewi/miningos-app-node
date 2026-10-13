@@ -212,9 +212,10 @@ const getEnergyConsumption = async (ctx, req) => {
   return [...byTs.values()].sort((a, b) => a.ts - b.ts)
 }
 
-// Upserts hourly consumption on the DCS worker. Saving an hour with zeros is how
-// it is cleared. Validated here first: the ork drops rack errors (a rejected write
-// comes back as an empty result), so success is only reported when a rack
+// Patches hourly consumption on the DCS worker: each entry replaces only the values
+// it passes (zeros included) and null clears one (it reads back as null), so a partial entry never wipes
+// the rest of the hour. Validated here first: the ork drops rack errors (a rejected
+// write comes back as an empty result), so success is only reported when a rack
 // confirms the write.
 const saveEnergyConsumption = async (ctx, req) => {
   const { entries } = req.body
