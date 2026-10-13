@@ -5884,6 +5884,33 @@ test('getEfficiency - telemetry phase divides ccm minus manual by the fleet hash
   t.is(daily.log[0].efficiencyWThs, 3500000 / 150, 'mean power over mean hashrate, like the site series')
 })
 
+test('getEfficiency - total divides site power by miner plus pool-only phase hashrate', async (t) => {
+  const H = PHASE_HOUR_MS
+  const ctx = phaseCtx(async (key, method, payload) => {
+    if (method === 'tailLog' && payload.type === 'miner') {
+      return [{ ts: `${PHASE_START}-${PHASE_START + H - 1}`, hashrate_mhs_5m_sum_aggr: 6e8 }]
+    }
+    if (method === 'tailLog') return [{ ts: `${PHASE_START}-${PHASE_START + H - 1}`, site_power_w: 13000000 }]
+    if (method === 'getWrkExtData') return [{ hashrateHistory: phaseHistorySamples() }]
+    return []
+  }, PHASE_DCS_FEATURE)
+  const query = { start: PHASE_START, end: PHASE_START + H - 1, interval: '1h' }
+
+  // 600 TH/s of miners + 50 TH/s at addr2 (phase1_5); addr1 belongs to the telemetry phase
+  const total = await getEfficiency(ctx, { query: { ...query, phase: 'total' } })
+  t.is(total.log.length, 1)
+  t.is(total.log[0].efficiencyWThs, 13000000 / 650)
+
+  const plain = await getEfficiency(phaseCtx(async (key, method, payload) => {
+    if (method === 'tailLog' && payload.type === 'miner') {
+      return [{ ts: `${PHASE_START}-${PHASE_START + H - 1}`, hashrate_mhs_5m_sum_aggr: 6e8 }]
+    }
+    if (method === 'tailLog') return [{ ts: `${PHASE_START}-${PHASE_START + H - 1}`, site_power_w: 13000000 }]
+    return []
+  }, { centralDCSSetup: { enabled: true } }), { query })
+  t.is(plain.log[0].efficiencyWThs, 13000000 / 600, 'without phases only the miners count')
+})
+
 test('getConsumption - manual phase reads the logged hours and rolls them up', async (t) => {
   const calls = []
   const ctx = phaseConsumptionCtx({

@@ -73,14 +73,7 @@ function aggregateContainerCapacity (tailLogResults) {
 // Live pool hashrate (MH/s) of the phases that exist only at the pool, summed
 // from the already-fetched minerpool stats. Zero when phases are not configured.
 function sumPoolOnlyPhasesHashrateMhs (ctx, poolDataResults) {
-  const phases = lPhases.getPoolOnlyPhases(ctx)
-  if (!phases.length) return 0
-
-  const accounts = new Set()
-  for (const phase of phases) {
-    const keys = lPhases.getPhaseAccountKeys(phase)
-    if (keys) for (const key of keys) accounts.add(key)
-  }
+  const accounts = lPhases.getPoolOnlyAccountKeys(ctx)
   if (!accounts.size) return 0
 
   let totalHs = 0
