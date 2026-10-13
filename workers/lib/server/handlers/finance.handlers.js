@@ -931,14 +931,15 @@ async function getRevenueSummary (ctx, req) {
   const { start, end, timezone } = resolveStartEnd(ctx, req)
   const period = req.query.period || PERIOD_TYPES.DAILY
 
-  // A phase scopes earnings and hashrate to its own pool accounts. Consumption
-  // still reads the site series through the getPhaseConsumption seam until the
-  // manual store is wired in, so phase rows split revenue/hashes correctly and
-  // their power-derived figures stay site-wide for now.
+  // A phase scopes earnings and hashrate to its own pool accounts and power to
+  // its own consumption series (manual entries, or its meter minus them).
   const phaseUsernames = phase ? lPhases.getPhaseUsernames(phase) : null
   const phaseHashrate = phase
     ? (c, r) => getHashrate(c, { ...r, query: { ...r.query, phase: phase.id } })
     : getHashrate
+  const phaseConsumption = phase
+    ? (c, r) => getConsumption(c, { ...r, query: { ...r.query, phase: phase.id } })
+    : getConsumption
   const phaseCacheTag = phase ? `|${phase.id}` : ''
 
   const [
@@ -971,7 +972,9 @@ async function getRevenueSummary (ctx, req) {
       query: { key: 'current_price' }
     }).then(r => cb(null, r)).catch(cb),
 
-    (cb) => getDailySeries(ctx, start, end, getConsumption, 'powerW', timezone)
+    // Manual entries are corrected after the fact, so a phase always recomputes
+    // its months instead of reading a cached rollup of stale entries.
+    (cb) => getDailySeries(ctx, start, end, phaseConsumption, 'powerW', timezone, !!phase, phaseCacheTag)
       .then(r => cb(null, r)).catch(cb),
 
     (cb) => getDailySeries(ctx, start, end, getMiningConsumption, 'miningPowerW', timezone)
@@ -1082,10 +1085,7 @@ async function getRevenueSummary (ctx, req) {
     const miningNetUSD = revenueUSD - revenueUSD * (taxFees.percent || 0) / 100 - (taxFees.fixed || 0) * consumptionMWh
 
     const actualPowerMW = powerW / 1000000
-    // Consumption stays site-wide on phase rows until the manual store lands,
-    // so crossing it with the phase's own nominal would read as nonsense
-    // (site MW over a container's nominal). Null beats a 1,100% uptime tile.
-    const powerUtilization = !phase && nominalPowerMW > 0
+    const powerUtilization = nominalPowerMW > 0
       ? safeDiv(actualPowerMW, nominalPowerMW)
       : null
 
@@ -1123,7 +1123,7 @@ async function getRevenueSummary (ctx, req) {
       powerUtilization,
       availableEnergyMWh: 0,
       nominalConsumptionMWh,
-      downtimeMWh: !phase && nominalPowerMW > 0 ? nominalConsumptionMWh - consumptionMWh : null,
+      downtimeMWh: nominalPowerMW > 0 ? nominalConsumptionMWh - consumptionMWh : null,
       lcoeUsdPerMwh,
       energySalesGrossUSD: fc.energySalesGrossUSD || 0,
       energySalesTaxesAndFeesUSD: fc.energySalesTaxesAndFeesUSD || 0,

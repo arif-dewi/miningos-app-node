@@ -59,7 +59,32 @@
     },
     "energyRollup": {
       "sinceTs": null
-    }
+    },
+    "phases": [
+      {
+        "id": "phase1",
+        "label": "Phase 1",
+        "minerTelemetry": true,
+        "consumption": { "source": "remainder", "meterKey": "ccm" },
+        "pool": {
+          "accounts": [
+            { "poolType": "ocean", "username": "<site-btc-address>" }
+          ]
+        }
+      },
+      {
+        "id": "phase1_5",
+        "label": "Phase 1.5",
+        "minerTelemetry": false,
+        "consumption": { "source": "manual" },
+        "pool": {
+          "accounts": [
+            { "poolType": "ocean", "username": "<acme-btc-address>" }
+          ]
+        },
+        "groups": { "minerType": "HBM", "container": "acme-container" }
+      }
+    ]
   },
   "ttl": 300,
   "site": "SITE_NAME",

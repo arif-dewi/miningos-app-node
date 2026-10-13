@@ -57,6 +57,7 @@ const { assertTimezone } = require('../lib/export/mappers')
 const { createMonthlyHashesCache } = require('../lib/monthlyHashesCache')
 const lPhases = require('../../phases.utils')
 const { resolvePoolHashrateForBuckets } = require('./pools.handlers')
+const { getEnergyConsumption } = require('./energy.handlers')
 const { extractGlobalConfig } = require('./site.utils')
 const { normalizeAvailability } = require('../lib/export/types/forecast.export')
 
@@ -693,14 +694,20 @@ function buildRollupConsumption (entries, bucketing, byMeter) {
 
 async function getConsumption (ctx, req) {
   const { start, end, timezone } = resolveStartEnd(ctx, req)
-  // Accepted once the manual consumption store feeds the phase seam; until
-  // then rejecting beats silently serving site-wide numbers under a phase tab.
-  // total stays a no-op so the Total Site tab can pass it like everywhere else.
-  if (req.query.phase && req.query.phase !== lPhases.PHASE_TOTAL) throw lPhases.phaseError('ERR_PHASE_NOT_SUPPORTED')
+  const phase = lPhases.resolvePhase(ctx, req)
 
   // Downstream grouped/by-meter/rack paths read start/end straight off req.query,
   // so the converted UTC values have to replace the raw ones here for those to see them.
   req = { ...req, query: { ...req.query, start, end } }
+
+  if (phase) {
+    // A phase is a single series built from hourly meter and manual values;
+    // there is no per-group, per-meter or per-rack split of it.
+    const byMeter = req.query.byMeter === true || req.query.byMeter === 'true'
+    if (req.query.groupBy || byMeter || hasRackFilter(req)) throw lPhases.phaseError('ERR_PHASE_NOT_SUPPORTED')
+    const interval = resolveInterval(start, end, req.query.interval)
+    return getPhaseConsumption(ctx, req, phase, { interval, timezone, start, end })
+  }
 
   if (req.query.groupBy) return getGroupedConsumption(ctx, req)
 
@@ -771,6 +778,77 @@ async function getConsumption (ctx, req) {
   const summary = calculateConsumptionSummary(log)
 
   return { log, summary }
+}
+
+const MANUAL_CONSUMPTION_FIELD = 'totalConsumptionMWh'
+
+// Meter ids are matched loosely: config may say 'CCM' for the 'ccm' by-meter key.
+const normalizeMeterKey = (id) => String(id).toLowerCase().replace(/[^a-z0-9]/g, '')
+
+// Manual MWh per hour start from the DCS worker's consumption log. Hours whose
+// value was never entered (or was cleared) are absent, not zero.
+async function fetchManualConsumptionByHour (ctx, start, end) {
+  const records = await getEnergyConsumption(ctx, { query: { start, end } })
+  const byHour = new Map()
+  for (const record of records) {
+    const mwh = record[MANUAL_CONSUMPTION_FIELD]
+    if (Number.isFinite(mwh)) byHour.set(record.ts, mwh)
+  }
+  return byHour
+}
+
+// Average W per hour start of one by_meter_power_w meter.
+async function fetchMeterPowerByHour (ctx, req, meterKey) {
+  const { log } = await getByMeterConsumption(ctx, { ...req, query: { ...req.query, interval: '1h' } })
+  const wanted = normalizeMeterKey(meterKey)
+  const byHour = new Map()
+  for (const entry of log) {
+    const match = Object.entries(entry.powerW || {}).find(([meter]) => normalizeMeterKey(meter) === wanted)
+    if (match && Number.isFinite(Number(match[1]))) byHour.set(entry.ts, Number(match[1]))
+  }
+  return byHour
+}
+
+/**
+ * Consumption of one phase, built hour by hour and then rolled up like the
+ * site series. A `manual` phase is the hourly MWh logged on the DCS worker; a
+ * `remainder` phase is its meter minus those manual entries, since the
+ * manually logged load is fed through that meter. An elapsed hour missing any
+ * input is left out of the series and counted in summary.missingHours rather
+ * than read as zero.
+ */
+async function getPhaseConsumption (ctx, req, phase, bucketing) {
+  const { source, meterKey } = lPhases.getPhaseConsumptionSource(phase)
+  const { start, end } = bucketing
+  if (!isCentralDCSEnabled(ctx)) throw new Error('ERR_PHASE_CONSUMPTION_REQUIRES_CENTRAL_DCS')
+
+  const [manualByHour, meterByHour] = await Promise.all([
+    fetchManualConsumptionByHour(ctx, start, end),
+    source === lPhases.CONSUMPTION_SOURCES.REMAINDER ? fetchMeterPowerByHour(ctx, req, meterKey) : null
+  ])
+
+  // Hours that have fully elapsed; the running hour has no entry yet by design.
+  const lastHourStart = Math.min(end, Date.now() - HOUR_MS)
+  const hourly = []
+  let missingHours = 0
+  for (let ts = Math.ceil(start / HOUR_MS) * HOUR_MS; ts <= lastHourStart; ts += HOUR_MS) {
+    const manualMWh = manualByHour.get(ts)
+    const meterW = meterByHour ? meterByHour.get(ts) : 0
+    if (manualMWh === undefined || meterW === undefined) {
+      missingHours++
+      continue
+    }
+    const consumptionMWh = meterByHour ? meterW / 1000000 - manualMWh : manualMWh
+    hourly.push({
+      ts,
+      timeRange: { startTs: ts, endTs: ts + HOUR_MS - 1 },
+      powerW: consumptionMWh * 1000000,
+      consumptionMWh
+    })
+  }
+
+  const log = isLocalInterval(bucketing.interval) ? rollupLocalConsumption(hourly, bucketing) : hourly
+  return { log, summary: { ...calculateConsumptionSummary(log), missingHours } }
 }
 
 // by_meter_power_w is only produced by the DCS worker, so the per-meter breakdown
@@ -991,8 +1069,8 @@ async function getEfficiency (ctx, req) {
 
   if (!lPhases.hasMinerTelemetry(phase)) {
     if (req.query.groupBy || hasRackFilter(req)) throw lPhases.phaseError('ERR_PHASE_INVALID')
-    const { key, groupRange } = getIntervalConfig(resolveInterval(start, end, req.query.interval))
-    return getPoolOnlyEfficiency(ctx, { req, phase, key, groupRange, start, end })
+    const interval = resolveInterval(start, end, req.query.interval)
+    return getPoolOnlyEfficiency(ctx, req, phase, { interval, timezone, start, end })
   }
 
   if (req.query.groupBy) return getGroupedEfficiency(ctx, req)
@@ -1005,6 +1083,10 @@ async function getEfficiency (ctx, req) {
 
   const interval = resolveInterval(start, end, req.query.interval)
   const bucketing = { interval, timezone, start, end }
+
+  // A telemetry phase's power is its own consumption series, not the site meter.
+  if (phase) return getTelemetryPhaseEfficiency(ctx, req, phase, bucketing)
+
   // Local days/weeks/months are rolled up from hourly buckets: the store's own '1D'/'1W'
   // sit on the UTC grid, so they started before `start` and spilled past `end`.
   const local = isLocalInterval(interval)
@@ -1115,58 +1197,86 @@ async function getDCSEfficiency (ctx, { key, groupRange, start, end, bucketing }
 }
 
 /**
- * Efficiency for a phase without MOS miners: its consumption (today still the
- * site series, via the getPhaseConsumption seam) over its own pool hashrate.
- * Once the manual consumption store is wired into the seam this becomes the
- * container's true efficiency without touching this function.
+ * Efficiency for a phase without MOS miners: its own consumption series (see
+ * getPhaseConsumption) over its own pool hashrate, bucket by bucket.
  */
-async function getPoolOnlyEfficiency (ctx, { req, phase, key, groupRange, start, end }) {
+async function getPoolOnlyEfficiency (ctx, req, phase, bucketing) {
+  const { start, end } = bucketing
+  const consumption = await getPhaseConsumption(ctx, req, phase, bucketing)
+  if (!consumption.log.length) {
+    return { log: [], summary: { ...calculateEfficiencySummary([]), missingHours: consumption.summary.missingHours } }
+  }
+
+  const buckets = consumption.log.map(({ ts, timeRange }) => ({ ts, ...timeRange }))
   const accounts = lPhases.getPhaseAccountKeys(phase)
-
-  const fetchSitePower = (c) => c.dataProxy.requestData(RPC_METHODS.TAIL_LOG, {
-    ...(isCentralDCSEnabled(c)
-      ? { type: WORKER_TYPES.DCS, tag: getDCSTag(c) }
-      : { type: WORKER_TYPES.POWERMETER, tag: WORKER_TAGS.POWERMETER }),
-    key,
-    groupRange,
-    shouldCalculateAvg: true,
-    start,
-    end,
-    fields: { [LOG_FIELDS.SITE_POWER]: 1 },
-    aggrFields: { [AGGR_FIELDS.SITE_POWER]: 1 }
-  })
-
-  const powerRes = await lPhases.getPhaseConsumption(ctx, req, phase, fetchSitePower)
-  const entries = firstOrkEntries(powerRes)
-  if (!entries.length) return { log: [], summary: calculateEfficiencySummary([]) }
-
-  const hourMs = 60 * 60 * 1_000
-  const bucketMs = RANGE_BUCKETS[groupRange] || hourMs // '1H'
-  const buckets = entries.map((val) => {
-    const ts = parseEntryTs(val.ts)
-    const timeRange = parseEntryTimeRange(val.ts)
-    return {
-      ts,
-      startTs: timeRange?.startTs ?? ts,
-      endTs: timeRange?.endTs ?? ts + bucketMs - 1
-    }
-  })
-
   const poolByBucket = await resolvePoolHashrateForBuckets(ctx, { start, end, buckets, accounts })
 
-  const log = entries.map((val, idx) => {
-    const ts = buckets[idx].ts
-    const timeRange = parseEntryTimeRange(val.ts)
-    const powerW = Number(val[AGGR_FIELDS.SITE_POWER]) || 0
+  const log = consumption.log.map(({ ts, timeRange, powerW }) => {
     const hashrateThs = mhsToThs(poolByBucket.get(ts) || 0)
-    return {
-      ts,
-      ...(timeRange && { timeRange }),
-      efficiencyWThs: hashrateThs > 0 ? powerW / hashrateThs : 0
-    }
+    return { ts, timeRange, efficiencyWThs: hashrateThs > 0 ? powerW / hashrateThs : 0 }
   })
 
-  return { log, summary: calculateEfficiencySummary(log) }
+  return { log, summary: { ...calculateEfficiencySummary(log), missingHours: consumption.summary.missingHours } }
+}
+
+/**
+ * Efficiency for a phase whose miners report to MOS: its consumption series
+ * (for a remainder phase, its meter minus the manual entries) over the fleet's
+ * miner hashrate, joined hour by hour and then averaged per bucket like the
+ * site series. An hour without a hashrate sample is counted in missingHours
+ * along with the hours the consumption series already left out.
+ */
+async function getTelemetryPhaseEfficiency (ctx, req, phase, bucketing) {
+  const { start, end, interval } = bucketing
+  const { key, groupRange } = getIntervalConfig('1h')
+
+  const [consumption, hashrateRes] = await Promise.all([
+    getPhaseConsumption(ctx, req, phase, { ...bucketing, interval: '1h' }),
+    ctx.dataProxy.requestData(RPC_METHODS.TAIL_LOG, {
+      type: WORKER_TYPES.MINER,
+      tag: WORKER_TAGS.MINER,
+      key,
+      groupRange,
+      shouldCalculateAvg: true,
+      start,
+      end,
+      fields: { [LOG_FIELDS.HASHRATE_SUM]: 1 },
+      aggrFields: { [AGGR_FIELDS.HASHRATE_SUM]: 1 }
+    })
+  ])
+
+  const hashrateByHour = new Map()
+  for (const val of firstOrkEntries(hashrateRes)) {
+    const hashrateMhs = Number(val[AGGR_FIELDS.HASHRATE_SUM])
+    if (Number.isFinite(hashrateMhs)) hashrateByHour.set(parseEntryTs(val.ts), hashrateMhs)
+  }
+
+  let missingHours = consumption.summary.missingHours
+  const points = []
+  for (const { ts, timeRange, powerW } of consumption.log) {
+    const hashrateMhs = hashrateByHour.get(ts)
+    if (hashrateMhs === undefined) {
+      missingHours++
+      continue
+    }
+    points.push({ ts, timeRange, powerW, hashrateMhs })
+  }
+
+  const buckets = isLocalInterval(interval)
+    ? groupLocalBuckets(points, bucketing).map(({ ts, timeRange, entries }) => ({
+      ts,
+      timeRange,
+      powerW: meanOfField(entries, 'powerW'),
+      hashrateMhs: meanOfField(entries, 'hashrateMhs')
+    }))
+    : points
+
+  const log = buckets.map(({ powerW, hashrateMhs, ...bucket }) => {
+    const hashrateThs = mhsToThs(hashrateMhs)
+    return { ...bucket, efficiencyWThs: hashrateThs > 0 ? powerW / hashrateThs : 0 }
+  })
+
+  return { log, summary: { ...calculateEfficiencySummary(log), missingHours } }
 }
 
 function calculateEfficiencySummary (log) {
