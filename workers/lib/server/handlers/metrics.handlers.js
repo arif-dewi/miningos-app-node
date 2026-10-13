@@ -1177,6 +1177,20 @@ async function getDCSEfficiency (ctx, { key, groupRange, start, end, bucketing }
     }
   })
 
+  // The site meter also feeds the pool-only phases (no miner telemetry), so
+  // their pool hashrate joins the miners' in the divisor. Points are hourly
+  // here (local intervals are rolled up below).
+  const poolOnlyAccounts = lPhases.getPoolOnlyAccountKeys(ctx)
+  if (poolOnlyAccounts.size && points.length) {
+    const buckets = points.map(({ ts, timeRange }) => ({
+      ts,
+      startTs: timeRange?.startTs ?? ts,
+      endTs: timeRange?.endTs ?? ts + HOUR_MS - 1
+    }))
+    const poolByBucket = await resolvePoolHashrateForBuckets(ctx, { start, end, buckets, accounts: poolOnlyAccounts })
+    for (const point of points) point.hashrateMhs += poolByBucket.get(point.ts) || 0
+  }
+
   const buckets = bucketing
     ? groupLocalBuckets(points, bucketing).map(({ ts, timeRange, entries }) => ({
       ts,

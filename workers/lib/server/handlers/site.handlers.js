@@ -37,6 +37,7 @@ const {
   sumPoolOnlyPhasesHashrateMhs
 } = require('./site.utils')
 const { flattenRpcResults } = require('../../utils')
+const lPhases = require('../../phases.utils')
 
 // Resolves consumption by featureConfig, mirroring the header UI:
 // totalSystemConsumptionHeader (0) > totalTransformerConsumptionHeader > site meter
@@ -327,7 +328,7 @@ async function getSiteOverviewGroupsStats (ctx, req) {
   return composeGroupsStats(minerStats, dcsThing, totalGroups)
 }
 
-function composeSiteEfficiency (minerStats, dcsThing) {
+function composeSiteEfficiency (minerStats, dcsThing, poolOnlyHashrateMhs = 0) {
   const config = dcsThing?.last?.snap?.config || {}
   const miningConfig = config.mining || {}
   const energyLayout = config.energy_layout || {}
@@ -390,10 +391,13 @@ function composeSiteEfficiency (minerStats, dcsThing) {
     })
   }
 
-  // Site-level efficiency
+  // Site-level efficiency: the site meter also feeds the pool-only phases, so
+  // their pool hashrate joins the miners' in the divisor. Mining efficiency
+  // stays rack meters over the miners those racks feed.
   const totalHashrateThs = mhsToThs(totalHashrateMhs)
-  const siteEfficiency = totalHashrateThs > 0
-    ? Math.round(((siteTotalKw * 1000) / totalHashrateThs) * 100) / 100
+  const siteHashrateThs = mhsToThs(totalHashrateMhs + poolOnlyHashrateMhs)
+  const siteEfficiency = siteHashrateThs > 0
+    ? Math.round(((siteTotalKw * 1000) / siteHashrateThs) * 100) / 100
     : 0
   const miningEfficiency = totalHashrateThs > 0
     ? Math.round(((totalMiningPowerKw * 1000) / totalHashrateThs) * 100) / 100
@@ -473,9 +477,16 @@ async function getSiteEfficiency (ctx, req) {
     }
   }
 
-  const [tailLogResults, dcsResults] = await Promise.all([
+  // Pool-only phases draw from the site meter without miner telemetry, so their
+  // live pool hashrate belongs in the site efficiency divisor.
+  const hasPoolOnlyPhases = lPhases.getPoolOnlyPhases(ctx).length > 0
+
+  const [tailLogResults, dcsResults, poolDataResults] = await Promise.all([
     ctx.dataProxy.requestDataMap('tailLogMulti', tailLogPayload),
-    dcsEnabled ? ctx.dataProxy.requestDataMap('listThings', dcsPayload) : Promise.resolve(null)
+    dcsEnabled ? ctx.dataProxy.requestDataMap('listThings', dcsPayload) : Promise.resolve(null),
+    hasPoolOnlyPhases
+      ? ctx.dataProxy.requestDataMap('getWrkExtData', { type: 'minerpool', query: { key: 'stats' } })
+      : Promise.resolve([])
   ])
 
   const minerStats = aggregateOverviewMinerStats(tailLogResults)
@@ -485,7 +496,7 @@ async function getSiteEfficiency (ctx, req) {
     throw new Error('ERR_DCS_DATA_NOT_FOUND')
   }
 
-  return composeSiteEfficiency(minerStats, dcsThing)
+  return composeSiteEfficiency(minerStats, dcsThing, sumPoolOnlyPhasesHashrateMhs(ctx, poolDataResults))
 }
 
 const CONTAINER_RUNNING_STATUS = 'running'

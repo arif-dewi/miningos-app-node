@@ -90,6 +90,18 @@ function getPoolOnlyPhases (ctx) {
 }
 
 /**
+ * Pool identity set of every pool-only phase together: the accounts whose
+ * hashrate the site efficiency divisor needs on top of miner telemetry.
+ */
+function getPoolOnlyAccountKeys (ctx) {
+  const keys = new Set()
+  for (const phase of getPoolOnlyPhases(ctx)) {
+    for (const key of getPhaseAccountKeys(phase)) keys.add(key)
+  }
+  return keys
+}
+
+/**
  * Per-phase nominals from the ork global config (`phaseNominals` keyed by
  * phase id). `globalConfigResults` is the per-ork array that
  * RPC_METHODS.GLOBAL_CONFIG returns.
@@ -138,6 +150,7 @@ module.exports = {
   getPhaseUsernames,
   hasMinerTelemetry,
   getPoolOnlyPhases,
+  getPoolOnlyAccountKeys,
   getPhaseNominals,
   getPhaseConsumptionSource
 }
