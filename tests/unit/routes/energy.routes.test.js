@@ -3,7 +3,7 @@
 const test = require('brittle')
 const { testModuleStructure, testHandlerFunctions, testOnRequestFunctions } = require('../helpers/routeTestHelpers')
 const { createRoutesForTest } = require('../helpers/mockHelpers')
-const { ENDPOINTS, HTTP_METHODS } = require('../../../workers/lib/constants')
+const { ENDPOINTS, HTTP_METHODS, AUTH_PERMISSIONS } = require('../../../workers/lib/constants')
 
 const ROUTES_PATH = '../../../workers/lib/server/routes/energy.routes.js'
 
@@ -23,6 +23,7 @@ test('energy routes - route definitions', (t) => {
   t.ok(routeUrls.includes(ENDPOINTS.ENERGY_FORECAST_OVERRIDE_HISTORY), 'should have forecast override history route')
   t.ok(routeUrls.includes(ENDPOINTS.ENERGY_AVAILABLE), 'should have available energy route')
   t.ok(routeUrls.includes(ENDPOINTS.ENERGY_AVAILABLE_HISTORY), 'should have available energy history route')
+  t.ok(routeUrls.includes(ENDPOINTS.ENERGY_CONSUMPTION), 'should have energy consumption route')
   t.pass()
 })
 
@@ -90,6 +91,114 @@ test('energy routes - availableEnergy schema validates availableMw items', (t) =
   t.absent(validateHist({ start: 1000, end: 2000 }), 'history rejects missing both fields')
   t.absent(validateHist({ start: 1000, end: 2000, availableMw: 48.1 }), 'history rejects availableMw above 48')
   t.pass()
+})
+
+test('energy routes - consumption GET and POST', (t) => {
+  const routes = createRoutesForTest(ROUTES_PATH).filter(r => r.url === ENDPOINTS.ENERGY_CONSUMPTION)
+  t.alike(routes.map(r => r.method).sort(), [HTTP_METHODS.GET, HTTP_METHODS.POST].sort(), 'GET and POST only, no DELETE')
+
+  const get = routes.find(r => r.method === HTTP_METHODS.GET)
+  t.alike(get.schema.querystring.required, ['start', 'end'])
+  t.ok(get.preValidation, 'GET rejects a timezone param')
+
+  const post = routes.find(r => r.method === HTTP_METHODS.POST)
+  t.ok(post.preValidation, 'POST rejects a timezone param')
+  t.alike(post.schema.body.required, ['entries'])
+})
+
+test('energy routes - consumption GET and POST require the powermeter permission', async (t) => {
+  const checks = []
+  const ctx = {
+    conf: { ttl: 3600 },
+    authLib: {
+      resolveToken: async () => ({ userId: 'u1' }),
+      tokenHasPerms: async (token, write, perms) => {
+        checks.push({ write, perms })
+        return true
+      }
+    }
+  }
+  const routes = require(ROUTES_PATH)(ctx).filter(r => r.url === ENDPOINTS.ENERGY_CONSUMPTION)
+
+  for (const method of [HTTP_METHODS.GET, HTTP_METHODS.POST]) {
+    const route = routes.find(r => r.method === method)
+    const req = { method, headers: { authorization: 'Bearer token' }, ip: '127.0.0.1', query: {} }
+    const rep = { status: () => { t.fail(`${method} should not be denied`); return rep }, send: () => rep }
+    await route.onRequest(req, rep)
+  }
+
+  t.alike(checks, [
+    { write: false, perms: [AUTH_PERMISSIONS.POWERMETER] },
+    { write: true, perms: [AUTH_PERMISSIONS.POWERMETER] }
+  ], 'GET checks powermeter at read level, POST at write level')
+  t.is(AUTH_PERMISSIONS.POWERMETER, 'powermeter', 'permission key is powermeter')
+})
+
+test('energy routes - energyConsumption schema validates partial entries', (t) => {
+  const Ajv = require('ajv')
+  const schemas = require('../../../workers/lib/server/schemas/energy.schemas')
+  const validate = new Ajv().compile(schemas.body.energyConsumption)
+  const validateQuery = new Ajv({ coerceTypes: true }).compile(schemas.query.energyConsumption)
+  const TS = 1767225600000
+  const FIELDS = ['totalConsumptionMWh', 'cduConsumptionMWh', 'rectifier1ConsumptionMWh', 'rectifier2ConsumptionMWh']
+  const full = { ts: TS, totalConsumptionMWh: 10, cduConsumptionMWh: 1, rectifier1ConsumptionMWh: 4, rectifier2ConsumptionMWh: 4 }
+
+  t.ok(validate({ entries: [full] }), 'accepts a full entry')
+  for (const field of FIELDS) {
+    t.ok(validate({ entries: [{ ts: TS, [field]: 3 }] }), `accepts ${field} alone`)
+    t.ok(validate({ entries: [{ ts: TS, [field]: 0 }] }), `accepts a zero ${field}`)
+    t.ok(validate({ entries: [{ ts: TS, [field]: null }] }), `accepts null ${field} (clears the value)`)
+    t.absent(validate({ entries: [{ ts: TS, [field]: -1 }] }), `rejects negative ${field}`)
+    t.absent(validate({ entries: [{ ts: TS, [field]: 'x' }] }), `rejects non-numeric ${field}`)
+  }
+  t.ok(validate({ entries: [{ ts: TS, totalConsumptionMWh: null, cduConsumptionMWh: 2, rectifier1ConsumptionMWh: 0 }] }), 'accepts mixed numbers, zeros and nulls')
+  t.absent(validate({ entries: [{ ts: TS }] }), 'rejects an entry that passes no value')
+  t.absent(validate({ entries: [{ cduConsumptionMWh: 1 }] }), 'rejects an entry without ts')
+  t.absent(validate({ entries: [{ ts: 1.5, cduConsumptionMWh: 1 }] }), 'rejects non-integer ts')
+  t.absent(validate({ entries: [{ ...full, note: 'x' }] }), 'rejects unknown fields')
+  t.absent(validate({ entries: [] }), 'rejects empty entries')
+  t.absent(validate({}), 'rejects missing entries')
+  t.absent(validate({ entries: new Array(745).fill(full) }), 'rejects more than a month of hours')
+
+  t.ok(validateQuery({ start: '0', end: '3600000' }), 'query coerces start/end')
+  t.absent(validateQuery({ start: 0 }), 'query requires end')
+})
+
+test('energy routes - consumption POST rejects values Fastify would coerce', async (t) => {
+  const Fastify = require('fastify')
+  const route = createRoutesForTest(ROUTES_PATH)
+    .find(r => r.url === ENDPOINTS.ENERGY_CONSUMPTION && r.method === HTTP_METHODS.POST)
+  const app = Fastify()
+  app.setErrorHandler((err, req, rep) => rep.code(400).send({ message: err.message }))
+  app.post('/x', { schema: route.schema, preValidation: route.preValidation }, async (req) => req.body)
+  t.teardown(() => app.close())
+
+  const send = (entry) => app.inject({ method: 'POST', url: '/x', payload: { entries: [entry] } })
+  const TS = 3600000
+
+  // sanity: without the hook these are silently coerced (the reason it exists)
+  const plain = Fastify()
+  plain.post('/x', { schema: route.schema }, async (req) => req.body)
+  t.teardown(() => plain.close())
+  const coerced = await plain.inject({ method: 'POST', url: '/x', payload: { entries: [{ ts: TS, cduConsumptionMWh: '' }] } })
+  t.is(coerced.json().entries[0].cduConsumptionMWh, null, 'an empty string would otherwise become null, i.e. clear a value')
+
+  for (const bad of ['', '7', false, true, [], {}]) {
+    const res = await send({ ts: TS, cduConsumptionMWh: bad })
+    t.is(res.statusCode, 400, `cdu=${JSON.stringify(bad)} rejected`)
+    t.is(res.json().message, 'ERR_CONSUMPTION_INVALID')
+  }
+  for (const bad of ['3600000', false]) {
+    const res = await send({ ts: bad, cduConsumptionMWh: 1 })
+    t.is(res.statusCode, 400, `ts=${JSON.stringify(bad)} rejected`)
+    t.is(res.json().message, 'ERR_TS_INVALID')
+  }
+
+  for (const good of [null, 0, 5.5]) {
+    const res = await send({ ts: TS, cduConsumptionMWh: good })
+    t.is(res.statusCode, 200, `cdu=${JSON.stringify(good)} accepted`)
+    t.is(res.json().entries[0].cduConsumptionMWh, good, 'passed through unchanged')
+  }
 })
 
 test('energy routes - handler functions', (t) => {

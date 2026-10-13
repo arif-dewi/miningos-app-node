@@ -31,7 +31,7 @@ These routes reject it with `400 ERR_TIMEZONE_UNSUPPORTED`:
 - `/auth/metrics/revenue/hourly`, `/auth/metrics/power-mode`, `/auth/metrics/power-mode/timeline`
 - `/auth/metrics/temperature`, `/auth/metrics/cooling`, `/auth/metrics/containers/:id/history`
 - `/auth/tail-log`, `/auth/tail-log/multi`, `/auth/history-log`
-- `/auth/site/power-consumption`, `/auth/energy/forecast/history`
+- `/auth/site/power-consumption`, `/auth/energy/forecast/history`, `/auth/energy/consumption`
 - `/auth/alerts/history`, `/auth/work-orders/:id/audit`
 
 ```json
@@ -1139,6 +1139,100 @@ curl -H "Authorization:Bearer TOKEN" \
 
 ---
 
+### Energy Consumption Endpoints
+
+Hourly consumption is stored on the DCS worker, one record per local hour of the site zone (`featureConfig.lockedTimezone`, default `America/Campo_Grande`). Every `ts` is the UTC ms instant at which that local hour starts, so in a zone like `Asia/Kolkata` (UTC+5:30) hours start at :30 UTC. The zone always comes from the site config; a `timezone` query parameter is rejected.
+
+#### `GET /auth/energy/consumption`
+
+**Get hourly consumption records for a time range**
+
+**Auth Required:** Yes (`powermeter:r`)  
+**Query Parameters:**
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `start` | integer | Yes | Start timestamp (ms, inclusive) |
+| `end` | integer | Yes | End timestamp (ms, inclusive) |
+| `overwriteCache` | boolean | No | Bypass cache |
+
+**Example:**
+```bash
+curl -H "Authorization:Bearer TOKEN" \
+  "http://localhost:3000/auth/energy/consumption?start=1767236400000&end=1767243600000"
+```
+
+**Response:** records ascending by `ts`. Hours with nothing stored are absent. Within a record, a value that was cleared is `null` and a value that was never set is missing; both mean unknown, which is different from `0`.
+```json
+[
+  {
+    "ts": 1767236400000,
+    "totalConsumptionMWh": 41.2,
+    "cduConsumptionMWh": 1.4,
+    "rectifier1ConsumptionMWh": 19.6,
+    "rectifier2ConsumptionMWh": 19.5,
+    "updatedAt": 1767240000000
+  }
+]
+```
+
+---
+
+#### `POST /auth/energy/consumption`
+
+**Create or update hourly consumption records**
+
+Each entry only changes the values it passes, so an entry can never wipe the rest of its hour:
+
+- a number replaces that value, and `0` is a real value;
+- `null` clears that value: it is stored and returned as `null` (absent/unknown);
+- a value that is left out is kept exactly as stored.
+
+An hour whose values are all `null` keeps its record. For an hour with no record yet, only the values passed are stored, and an entry that passes only `null`s creates no record. There is no delete endpoint: use `null` to clear values. The whole request is rejected if any entry is invalid, and nothing is applied.
+
+**Auth Required:** Yes (`powermeter:rw`)  
+**Body:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `entries` | array | Yes | 1 to 744 entries |
+| `entries[].ts` | integer | Yes | Start of a local hour in the site zone (UTC ms) |
+| `entries[].totalConsumptionMWh` | number ≥ 0 or `null` | At least one of these four | Total consumption for the hour |
+| `entries[].cduConsumptionMWh` | number ≥ 0 or `null` | ↑ | CDU consumption |
+| `entries[].rectifier1ConsumptionMWh` | number ≥ 0 or `null` | ↑ | Rectifier 1 consumption |
+| `entries[].rectifier2ConsumptionMWh` | number ≥ 0 or `null` | ↑ | Rectifier 2 consumption |
+
+`ts` and the values must be real JSON numbers (or `null`): strings and booleans are rejected rather than converted, so a stray `""` or `false` cannot clear or zero a value.
+
+**Example:**
+```bash
+curl -X POST -H "Authorization:Bearer TOKEN" -H "Content-Type: application/json" \
+  -d '{"entries":[{"ts":1767236400000,"totalConsumptionMWh":41.2,"cduConsumptionMWh":1.4,"rectifier1ConsumptionMWh":19.6,"rectifier2ConsumptionMWh":19.5}]}' \
+  "http://localhost:3000/auth/energy/consumption"
+```
+
+To correct one value, set another to zero and clear a third, leaving the rest of the hour as stored:
+```bash
+curl -X POST -H "Authorization:Bearer TOKEN" -H "Content-Type: application/json" \
+  -d '{"entries":[{"ts":1767236400000,"cduConsumptionMWh":0,"rectifier2ConsumptionMWh":null}]}' \
+  "http://localhost:3000/auth/energy/consumption"
+```
+
+**Response:** `upserted` is the number of entries applied.
+```json
+{ "success": true, "upserted": 1 }
+```
+
+**Errors (400):**
+
+| Message | Cause |
+|---------|-------|
+| `ERR_TS_NOT_HOUR_ALIGNED` | A `ts` is not the start of a local hour in the site zone |
+| `ERR_TS_DUPLICATE` | The same `ts` appears twice in `entries` |
+| `ERR_TS_INVALID` | A `ts` is not a number |
+| `ERR_CONSUMPTION_INVALID` | A value is not a number or `null` |
+| `ERR_CONSUMPTION_SAVE_FAILED` | No DCS worker confirmed the write (worker unreachable or not yet upgraded) |
+| `ERR_TIMEZONE_UNSUPPORTED` | A `timezone` query parameter was sent |
 ### Site Phases (per-phase metrics)
 
 A deployment can split its reporting into phases via `featureConfig.phases` in `config/common.json` — a list of `{ id, label, pool.accounts[], consumption.{source,logType,meterKey}, minerTelemetry, groups.{minerType,container} }`. The `total` id is reserved and means "no filtering". Without the key, nothing changes anywhere.
