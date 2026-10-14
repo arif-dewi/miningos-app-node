@@ -1070,7 +1070,9 @@ async function injectSyntheticConsumptionGroups (ctx, req, log) {
       // losing telemetry to the overwrite would be worse than the group going missing.
       if (entry.powerW[key] !== undefined) continue
       entry.powerW[key] = powerW
-      entry.consumptionMWh[key] = (powerW * 24) / 1000000
+      // The energy actually logged, not the mean stretched over 24 h: a day with only
+      // some hours entered would otherwise report hours that were never logged.
+      entry.consumptionMWh[key] = totalMWh
     }
   }
 }
@@ -1126,6 +1128,9 @@ function calculateGroupedConsumptionSummary (log, groupBy) {
 
   const groupTotals = {}
   const groupCounts = {}
+  // MWh a row carries itself where it differs from its power over 24 h (a manual
+  // phase group with only some hours logged): the gap is added to the 24 h total.
+  const groupMWhAdjust = {}
 
   for (const entry of log) {
     const powerW = entry.powerW
@@ -1134,24 +1139,32 @@ function calculateGroupedConsumptionSummary (log, groupBy) {
         const v = Number(val) || 0
         groupTotals[name] = (groupTotals[name] || 0) + v
         groupCounts[name] = (groupCounts[name] || 0) + 1
+        const mwh = entry.consumptionMWh?.[name]
+        const fullDayMWh = (v * 24) / 1000000
+        if (Number.isFinite(mwh) && mwh !== fullDayMWh) {
+          groupMWhAdjust[name] = (groupMWhAdjust[name] || 0) + mwh - fullDayMWh
+        }
       }
     }
   }
 
   const byGroup = {}
   let siteTotal = 0
+  let siteMWhAdjust = 0
   for (const [name, total] of Object.entries(groupTotals)) {
     const avgPowerW = safeDiv(total, groupCounts[name])
+    const adjust = groupMWhAdjust[name] || 0
     byGroup[name] = {
       avgPowerW,
-      totalConsumptionMWh: (total * 24) / 1000000
+      totalConsumptionMWh: (total * 24) / 1000000 + adjust
     }
     siteTotal += total
+    siteMWhAdjust += adjust
   }
 
   return {
     avgPowerW: safeDiv(siteTotal, log.length),
-    totalConsumptionMWh: (siteTotal * 24) / 1000000,
+    totalConsumptionMWh: (siteTotal * 24) / 1000000 + siteMWhAdjust,
     groupedBy: byGroup
   }
 }
