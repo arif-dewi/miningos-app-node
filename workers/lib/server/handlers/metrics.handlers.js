@@ -1020,6 +1020,61 @@ const CONSUMPTION_GROUP_FIELDS = {
   rack: { field: LOG_FIELDS.POWER_W_RACK_GROUP_SUM, aggrField: AGGR_FIELDS.POWER_W_RACK_GROUP_SUM }
 }
 
+/**
+ * Adds the configured synthetic group (e.g. the container's miner type) of every
+ * manually measured phase to the grouped consumption, so the Miner Type / Mining
+ * Unit views list the phase next to the telemetry-backed groups, as the grouped
+ * hashrate does. Its power is the mean of the hours logged in each day; a day
+ * without any logged hour gets no key rather than a zero. The grouped series is
+ * miner telemetry only, so the phase's load is not counted twice.
+ */
+async function injectSyntheticConsumptionGroups (ctx, req, log) {
+  if (!log.length) return
+  // `total` must list the phase groups exactly like a phase-less request.
+  if (lPhases.resolvePhase(ctx, req)) return
+
+  const groupBy = req.query.groupBy
+  if (groupBy !== 'miner' && groupBy !== 'container') return
+  if (!isCentralDCSEnabled(ctx)) return
+
+  const keys = (lPhases.getPhases(ctx) || [])
+    .filter((p) => p?.consumption?.source === lPhases.CONSUMPTION_SOURCES.MANUAL)
+    .map((p) => (groupBy === 'miner' ? p.groups?.minerType : p.groups?.container))
+    .filter(Boolean)
+  if (!keys.length) return
+
+  const dayMs = METRICS_TIME.ONE_DAY_MS
+  const firstDay = Math.min(...log.map((entry) => entry.ts))
+  const lastDay = Math.max(...log.map((entry) => entry.ts))
+  // Daily rows sit on UTC midnights that can precede `start`: read their whole days.
+  const manualByHour = await fetchManualConsumptionByHour(ctx, firstDay, lastDay + dayMs - 1)
+
+  for (const entry of log) {
+    let totalMWh = 0
+    let hours = 0
+    for (const [ts, mwh] of manualByHour) {
+      if (ts < entry.ts || ts >= entry.ts + dayMs) continue
+      totalMWh += mwh
+      hours++
+    }
+    if (!hours) continue
+
+    const powerW = (totalMWh / hours) * 1000000
+    // Copies: the maps can be shared with the worker response (or between rows)
+    entry.powerW = entry.powerW && typeof entry.powerW === 'object' ? { ...entry.powerW } : {}
+    entry.consumptionMWh = entry.consumptionMWh && typeof entry.consumptionMWh === 'object'
+      ? { ...entry.consumptionMWh }
+      : {}
+    for (const key of keys) {
+      // A synthetic key colliding with a real device-type key is a config error;
+      // losing telemetry to the overwrite would be worse than the group going missing.
+      if (entry.powerW[key] !== undefined) continue
+      entry.powerW[key] = powerW
+      entry.consumptionMWh[key] = (powerW * 24) / 1000000
+    }
+  }
+}
+
 async function getGroupedConsumption (ctx, req) {
   const { groupBy, start, end } = req.query
 
@@ -1053,6 +1108,8 @@ async function getGroupedConsumption (ctx, req) {
     })
     return aggr
   }, [])
+
+  await injectSyntheticConsumptionGroups(ctx, req, log)
 
   const summary = calculateGroupedConsumptionSummary(log, groupBy)
 
