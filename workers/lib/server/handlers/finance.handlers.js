@@ -937,8 +937,16 @@ async function getRevenueSummary (ctx, req) {
   const phaseHashrate = phase
     ? (c, r) => getHashrate(c, { ...r, query: { ...r.query, phase: phase.id } })
     : getHashrate
+  // A phase always recomputes (refresh below), so getDailySeries makes exactly one
+  // call over [start, end]; keep its hours to tell which ones had no entry.
+  const phaseCoverage = { hours: new Set(), missingHours: 0 }
   const phaseConsumption = phase
-    ? (c, r) => getConsumption(c, { ...r, query: { ...r.query, phase: phase.id } })
+    ? async (c, r) => {
+      const res = await getConsumption(c, { ...r, query: { ...r.query, phase: phase.id } })
+      for (const entry of res.log) phaseCoverage.hours.add(entry.ts)
+      phaseCoverage.missingHours += res.summary.missingHours
+      return res
+    }
     : getConsumption
   const phaseCacheTag = phase ? `|${phase.id}` : ''
 
@@ -1043,13 +1051,15 @@ async function getRevenueSummary (ctx, req) {
     : extractNominalPower(globalConfigResults)
   const dailyForecast = processForecastHistory(forecastResults, timezone)
   const taxFees = extractForecastSettings(forecastSettingsResults).miningRevenueTaxFees || {}
+  const missingHoursByDay = phase ? countMissingHoursByDay(phaseCoverage.hours, start, end, timezone) : {}
 
   const allDays = new Set([
     ...Object.keys(dailyRevenue),
     ...Object.keys(dailyForecast),
     ...Object.keys(dailyPower),
     ...Object.keys(dailyHashrate),
-    ...Object.keys(dailyPrices)
+    ...Object.keys(dailyPrices),
+    ...Object.keys(missingHoursByDay)
   ])
 
   const log = []
@@ -1067,6 +1077,11 @@ async function getRevenueSummary (ctx, req) {
     const revenueUSD = revenue.revenueUSD || 0
     const feesUSD = revenue.feesUSD || 0
 
+    // A phase day with no consumption entry at all is unknown: power and energy stay
+    // 0 so costs still add up, but utilization and downtime are null rather than
+    // reading as an idle day. Partially covered days extrapolate the mean of the
+    // hours present; missingHours flags them.
+    const powerKnown = !phase || dayTs in dailyPower
     const powerW = dailyPower[dayTs] || 0
     const consumptionMWh = (powerW * 24) / 1000000
     // A day the hashrate series never reported is unknown, not zero. Zero-filling it here
@@ -1090,7 +1105,7 @@ async function getRevenueSummary (ctx, req) {
     const miningNetUSD = revenueUSD - revenueUSD * (taxFees.percent || 0) / 100 - (taxFees.fixed || 0) * consumptionMWh
 
     const actualPowerMW = powerW / 1000000
-    const powerUtilization = nominalPowerMW > 0
+    const powerUtilization = nominalPowerMW > 0 && powerKnown
       ? safeDiv(actualPowerMW, nominalPowerMW)
       : null
 
@@ -1128,7 +1143,8 @@ async function getRevenueSummary (ctx, req) {
       powerUtilization,
       availableEnergyMWh: 0,
       nominalConsumptionMWh,
-      downtimeMWh: nominalPowerMW > 0 ? nominalConsumptionMWh - consumptionMWh : null,
+      downtimeMWh: nominalPowerMW > 0 && powerKnown ? nominalConsumptionMWh - consumptionMWh : null,
+      ...(phase && { missingHours: missingHoursByDay[dayTs] || 0 }),
       lcoeUsdPerMwh,
       energySalesGrossUSD: fc.energySalesGrossUSD || 0,
       energySalesTaxesAndFeesUSD: fc.energySalesTaxesAndFeesUSD || 0,
@@ -1155,8 +1171,11 @@ async function getRevenueSummary (ctx, req) {
   for (const entry of aggregated) {
     entry.btcProductionCost = safeDiv(entry.totalCostsUSD, entry.revenueBTC)
     entry.miningConsumptionMWh ??= null
+    // Downtime is known exactly when utilization is; the period sum reads null as 0.
+    if (entry.powerUtilization === null) entry.downtimeMWh = null
   }
   const summary = calculateDetailedRevenueSummary(aggregated, currentBtcPrice)
+  if (phase) summary.missingHours = phaseCoverage.missingHours
 
   return {
     log: aggregated,
@@ -1195,6 +1214,17 @@ function resolveCapex (ctx, phase, costParameters) {
     capexUsd: known.length ? known.reduce((a, b) => a + b, 0) : null,
     capexMissingPhases
   }
+}
+
+// Elapsed hours of [start, end] with no consumption entry, per local day.
+function countMissingHoursByDay (presentHours, start, end, timezone) {
+  const byDay = {}
+  for (const ts of lPhases.elapsedHourStarts(start, end)) {
+    if (presentHours.has(ts)) continue
+    const dayTs = localDayStart(ts, timezone)
+    byDay[dayTs] = (byDay[dayTs] || 0) + 1
+  }
+  return byDay
 }
 
 function calculateDetailedRevenueSummary (log, currentBtcPrice) {
@@ -1242,7 +1272,7 @@ function calculateDetailedRevenueSummary (log, currentBtcPrice) {
     acc.costsUSD += entry.totalCostsUSD || 0
     acc.availableEnergyMWh += entry.availableEnergyMWh || 0
     acc.nominalConsumptionMWh += entry.nominalConsumptionMWh || 0
-    acc.downtimeMWh += entry.downtimeMWh || 0
+    if (entry.downtimeMWh != null) acc.downtimeMWh = (acc.downtimeMWh ?? 0) + entry.downtimeMWh
     acc.payoutBTC += entry.payoutBTC || 0
     acc.rebateBTC += entry.rebateBTC || 0
     acc.energySalesGrossUSD += entry.energySalesGrossUSD || 0
@@ -1278,7 +1308,7 @@ function calculateDetailedRevenueSummary (log, currentBtcPrice) {
     costsUSD: 0,
     availableEnergyMWh: 0,
     nominalConsumptionMWh: 0,
-    downtimeMWh: 0,
+    downtimeMWh: null,
     payoutBTC: 0,
     rebateBTC: 0,
     energySalesGrossUSD: 0,
