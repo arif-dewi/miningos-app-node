@@ -485,6 +485,114 @@ test('getHashrate - interval selects the bucket range', async (t) => {
   t.pass()
 })
 
+test('getHashrate - a sub-hour interval reads its own log instead of bucketing a coarser one', async (t) => {
+  const captured = []
+  const mockCtx = withDataProxy({
+    conf: { orks: [{ rpcPublicKey: 'key1' }] },
+    net_r0: {
+      jRequest: async (key, method, payload) => {
+        captured.push(payload)
+        return []
+      }
+    }
+  })
+
+  const start = 1700000000000
+  const end = start + 24 * 60 * 60 * 1000
+  await getHashrate(mockCtx, { query: { start, end, interval: '5m' } })
+  await getHashrate(mockCtx, { query: { start, end, interval: '30m' } })
+  await getHashrate(mockCtx, { query: { start, end, interval: '3h' } })
+
+  t.is(captured[0].key, 'stat-5m', '5m should read the stat-5m log')
+  t.absent(captured[0].groupRange, '5m should not ask the store to re-bucket')
+  t.absent(captured[0].shouldCalculateAvg, 'there is nothing to average within one sample')
+  t.is(captured[0].limit, 289, 'a day of 5-minute samples, plus the bucket on the seam')
+
+  t.is(captured[1].key, 'stat-30m', '30m should read the stat-30m log')
+  t.absent(captured[1].groupRange, '30m should not ask the store to re-bucket')
+  t.is(captured[1].limit, 49, 'a day of 30-minute samples, plus the bucket on the seam')
+
+  t.is(captured[2].key, 'stat-3h', '3h should read the stat-3h log')
+  t.absent(captured[2].groupRange, '3h should not ask the store to re-bucket')
+  t.is(captured[2].limit, 9, 'a day of 3-hour samples, plus the bucket on the seam')
+  t.pass()
+})
+
+test('getHashrate - a sub-hour interval emits one entry per sample', async (t) => {
+  const start = 1700000000000
+  const mockCtx = withDataProxy({
+    conf: { orks: [{ rpcPublicKey: 'key1' }] },
+    net_r0: {
+      jRequest: async () => [
+        { ts: start, hashrate_mhs_5m_sum_aggr: 100000 },
+        { ts: start + 300000, hashrate_mhs_5m_sum_aggr: 110000 },
+        { ts: start + 600000, hashrate_mhs_5m_sum_aggr: 120000 }
+      ]
+    }
+  })
+
+  const result = await getHashrate(mockCtx, {
+    query: { start, end: start + 3600000, interval: '5m' }
+  })
+
+  t.is(result.log.length, 3, 'should emit every sample, not an hourly mean of them')
+  t.is(result.log[1].ts - result.log[0].ts, 300000, 'samples should stay 5 minutes apart')
+  t.is(result.log[2].hashrateMhs, 120000, 'should read each sample value as-is')
+  t.is(result.summary.avgHashrateMhs, 110000, 'summary should average the samples')
+  t.pass()
+})
+
+test('getHashrate - a raw interval refuses a window too wide to read sample by sample', async (t) => {
+  let called = false
+  const mockCtx = withDataProxy({
+    conf: { orks: [{ rpcPublicKey: 'key1' }] },
+    net_r0: {
+      jRequest: async () => {
+        called = true
+        return []
+      }
+    }
+  })
+
+  const end = 1700000000000
+  const day = 24 * 60 * 60 * 1000
+
+  // 3.5 days of 5-minute samples is ~1008 rows - just past the cap.
+  await t.exception(
+    getHashrate(mockCtx, { query: { start: end - 4 * day, end, interval: '5m' } }),
+    /ERR_INTERVAL_RANGE_TOO_WIDE/,
+    'a quarter of 5-minute samples must not be read row by row'
+  )
+  t.absent(called, 'should refuse before asking the store for anything')
+
+  // The widest the dashboard itself asks for stays well inside the cap.
+  await getHashrate(mockCtx, { query: { start: end - 30 * day, end, interval: '3h' } })
+  t.ok(called, '3h across 30 days is 241 rows and should go through')
+  t.pass()
+})
+
+test('getHashrate - a sub-hour interval still rolls grouped rows up from hourly buckets', async (t) => {
+  const captured = []
+  const mockCtx = withDataProxy({
+    conf: { orks: [{ rpcPublicKey: 'key1' }] },
+    net_r0: {
+      jRequest: async (key, method, payload) => {
+        captured.push(payload)
+        return []
+      }
+    }
+  })
+
+  await getHashrate(mockCtx, {
+    query: { start: 1700000000000, end: 1700100000000, interval: '5m', groupBy: 'container' }
+  })
+
+  // There is no raw grouped path: a null groupRange here would reach the store unpaged.
+  t.is(captured[0].groupRange, '1H', 'grouped rows should fall back to hourly buckets')
+  t.is(captured[0].key, 'stat-30m', 'grouped rows should sample the stat-30m log')
+  t.pass()
+})
+
 test('getHashrate - pool=true merges pool hashrate per bucket, in MH/s', async (t) => {
   let capturedExtData = null
   const mockCtx = withDataProxy({

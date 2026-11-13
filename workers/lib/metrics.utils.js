@@ -133,7 +133,57 @@ function resolveInterval (start, end, requested) {
   return '1w'
 }
 
+/**
+ * Intervals served by reading a stat log at its own cadence instead of bucketing a
+ * coarser one. The store has no sub-hour groupRange, so '1h' is the finest window it
+ * can cut - but stat-5m and stat-30m are already written at these steps, so one entry
+ * per sample IS the series. Re-bucketing them would only coarsen what is already there.
+ */
+const RAW_INTERVALS = {
+  '5m': { key: LOG_KEYS.STAT_5M, stepMs: 5 * 60 * 1000 },
+  '30m': { key: LOG_KEYS.STAT_30M, stepMs: 30 * 60 * 1000 },
+  '3h': { key: LOG_KEYS.STAT_3H, stepMs: 3 * 60 * 60 * 1000 }
+}
+
+/**
+ * A grouped read is bounded by its range whatever the window: the store collapses the
+ * samples before shipping them. A raw one is not - it returns one row per sample, so
+ * '5m' over a quarter would ask for ~26k of them. Matches the cap containerHistory
+ * already puts on an ungrouped read, and leaves ample headroom over the widest view the
+ * dashboard asks for (3h across 30 days, 240 samples).
+ */
+const RAW_INTERVAL_MAX_SAMPLES = 1000
+
+function isRawInterval (interval) {
+  return Object.hasOwn(RAW_INTERVALS, interval)
+}
+
+/** Step width of a raw interval, for callers that need the bucket window. */
+function rawIntervalStepMs (interval) {
+  return RAW_INTERVALS[interval]?.stepMs ?? null
+}
+
+/**
+ * Row limit for reading `interval` raw across [start, end], or null if it is not a raw
+ * interval. Too wide a window is refused rather than silently coarsened: answering at a
+ * resolution other than the one asked for is the very bug this path exists to fix.
+ */
+function rawIntervalLimit (interval, start, end) {
+  const stepMs = rawIntervalStepMs(interval)
+  if (!stepMs) return null
+
+  const samples = Math.ceil((end - start) / stepMs) + 1
+  if (samples > RAW_INTERVAL_MAX_SAMPLES) {
+    throw new Error('ERR_INTERVAL_RANGE_TOO_WIDE')
+  }
+
+  return samples
+}
+
 function getIntervalConfig (interval) {
+  // A raw interval carries no groupRange: callers must read the log as it stands.
+  if (isRawInterval(interval)) return { key: RAW_INTERVALS[interval].key, groupRange: null }
+
   switch (interval) {
     case '1h':
       // Sample the finer-grained stat-30m log and bucket it into 1h windows,
@@ -471,6 +521,10 @@ module.exports = {
   extractKeyEntry,
   resolveInterval,
   getIntervalConfig,
+  isRawInterval,
+  rawIntervalStepMs,
+  rawIntervalLimit,
+  RAW_INTERVAL_MAX_SAMPLES,
   zoneOffsetMs,
   rollupLocalDays,
   rollupLocalMonths,
