@@ -1,7 +1,7 @@
 'use strict'
 
 const { getStartOfDay, zoneOffsetMs, localDayStart, localWeekStart, localMonthStartTs, requireZone } = require('./period.utils')
-const { METRICS_TIME, LOG_KEYS, LOCKED_TIMEZONE_DEFAULT } = require('./constants')
+const { METRICS_TIME, LOG_KEYS, LOCKED_TIMEZONE_DEFAULT, TAIL_LOG_MAX_ROWS, TAIL_LOG_BUCKET_MS } = require('./constants')
 
 /**
  * Parse timestamp from RPC entry.
@@ -140,49 +140,48 @@ function resolveInterval (start, end, requested) {
  * per sample IS the series. Re-bucketing them would only coarsen what is already there.
  */
 const RAW_INTERVALS = {
-  '5m': { key: LOG_KEYS.STAT_5M, stepMs: 5 * 60 * 1000 },
-  '30m': { key: LOG_KEYS.STAT_30M, stepMs: 30 * 60 * 1000 },
-  '3h': { key: LOG_KEYS.STAT_3H, stepMs: 3 * 60 * 60 * 1000 }
+  '5m': LOG_KEYS.STAT_5M,
+  '30m': LOG_KEYS.STAT_30M,
+  '3h': LOG_KEYS.STAT_3H
 }
-
-/**
- * A grouped read is bounded by its range whatever the window: the store collapses the
- * samples before shipping them. A raw one is not - it returns one row per sample, so
- * '5m' over a quarter would ask for ~26k of them. Matches the cap containerHistory
- * already puts on an ungrouped read, and leaves ample headroom over the widest view the
- * dashboard asks for (3h across 30 days, 240 samples).
- */
-const RAW_INTERVAL_MAX_SAMPLES = 1000
 
 function isRawInterval (interval) {
   return Object.hasOwn(RAW_INTERVALS, interval)
 }
 
-/** Step width of a raw interval, for callers that need the bucket window. */
+/**
+ * Step width of a raw interval, for callers that need the bucket window. Read off the
+ * same map the tail-log range guard uses, so how wide a bucket of a given log is stays
+ * stated once.
+ */
 function rawIntervalStepMs (interval) {
-  return RAW_INTERVALS[interval]?.stepMs ?? null
+  return TAIL_LOG_BUCKET_MS[RAW_INTERVALS[interval]] ?? null
 }
 
 /**
  * Row limit for reading `interval` raw across [start, end], or null if it is not a raw
- * interval. Too wide a window is refused rather than silently coarsened: answering at a
- * resolution other than the one asked for is the very bug this path exists to fix.
+ * interval.
+ *
+ * A grouped read is bounded by its range whatever the window, because the store collapses
+ * the samples before shipping them. A raw one returns a row per sample, so '5m' over a
+ * quarter would ask for ~26k of them. Held to the same rule the tail-log route applies to
+ * its own raw reads (assertRangeWithinRowLimit) rather than a second cap of its own, and
+ * refused rather than silently coarsened: answering at a resolution other than the one
+ * asked for is the bug this path exists to fix. The widest view the dashboard asks for,
+ * 3h across 30 days, is 241 rows.
  */
 function rawIntervalLimit (interval, start, end) {
   const stepMs = rawIntervalStepMs(interval)
   if (!stepMs) return null
 
-  const samples = Math.ceil((end - start) / stepMs) + 1
-  if (samples > RAW_INTERVAL_MAX_SAMPLES) {
-    throw new Error('ERR_INTERVAL_RANGE_TOO_WIDE')
-  }
+  if ((end - start) / stepMs > TAIL_LOG_MAX_ROWS) throw new Error('ERR_RANGE_TOO_LARGE')
 
-  return samples
+  return Math.ceil((end - start) / stepMs) + 1
 }
 
 function getIntervalConfig (interval) {
   // A raw interval carries no groupRange: callers must read the log as it stands.
-  if (isRawInterval(interval)) return { key: RAW_INTERVALS[interval].key, groupRange: null }
+  if (isRawInterval(interval)) return { key: RAW_INTERVALS[interval], groupRange: null }
 
   switch (interval) {
     case '1h':
@@ -524,7 +523,6 @@ module.exports = {
   isRawInterval,
   rawIntervalStepMs,
   rawIntervalLimit,
-  RAW_INTERVAL_MAX_SAMPLES,
   zoneOffsetMs,
   rollupLocalDays,
   rollupLocalMonths,

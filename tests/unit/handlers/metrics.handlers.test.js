@@ -557,11 +557,12 @@ test('getHashrate - a raw interval refuses a window too wide to read sample by s
   const end = 1700000000000
   const day = 24 * 60 * 60 * 1000
 
-  // 3.5 days of 5-minute samples is ~1008 rows - just past the cap.
+  // 32 days of 5-minute samples is 9216 rows, past the 9000 the tail-log route allows a
+  // raw read. Same rule, same error, rather than a second cap of this endpoint's own.
   await t.exception(
-    getHashrate(mockCtx, { query: { start: end - 4 * day, end, interval: '5m' } }),
-    /ERR_INTERVAL_RANGE_TOO_WIDE/,
-    'a quarter of 5-minute samples must not be read row by row'
+    getHashrate(mockCtx, { query: { start: end - 32 * day, end, interval: '5m' } }),
+    /ERR_RANGE_TOO_LARGE/,
+    'a month of 5-minute samples must not be read row by row'
   )
   t.absent(called, 'should refuse before asking the store for anything')
 
@@ -571,7 +572,7 @@ test('getHashrate - a raw interval refuses a window too wide to read sample by s
   t.pass()
 })
 
-test('getHashrate - a sub-hour interval still rolls grouped rows up from hourly buckets', async (t) => {
+test('getHashrate - a grouped request honours a raw interval instead of coarsening it', async (t) => {
   const captured = []
   const mockCtx = withDataProxy({
     conf: { orks: [{ rpcPublicKey: 'key1' }] },
@@ -583,13 +584,25 @@ test('getHashrate - a sub-hour interval still rolls grouped rows up from hourly 
     }
   })
 
+  const end = 1700000000000
+  const day = 24 * 60 * 60 * 1000
+
   await getHashrate(mockCtx, {
-    query: { start: 1700000000000, end: 1700100000000, interval: '5m', groupBy: 'container' }
+    query: { start: end - day, end, interval: '5m', groupBy: 'container' }
   })
 
-  // There is no raw grouped path: a null groupRange here would reach the store unpaged.
-  t.is(captured[0].groupRange, '1H', 'grouped rows should fall back to hourly buckets')
-  t.is(captured[0].key, 'stat-30m', 'grouped rows should sample the stat-30m log')
+  t.is(captured[0].key, 'stat-5m', 'grouped rows should read the log the interval names')
+  t.absent(captured[0].groupRange, 'and should not re-bucket it')
+  t.is(captured[0].limit, 289, 'the limit is what keeps an ungrouped grouped read paged')
+
+  // The cap applies here too: without it a null groupRange reaches the store unbounded.
+  await t.exception(
+    getHashrate(mockCtx, {
+      query: { start: end - 32 * day, end, interval: '5m', groupBy: 'container' }
+    }),
+    /ERR_RANGE_TOO_LARGE/,
+    'a grouped raw read is bounded by the same rule'
+  )
   t.pass()
 })
 

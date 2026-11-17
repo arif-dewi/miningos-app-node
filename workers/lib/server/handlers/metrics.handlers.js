@@ -43,7 +43,6 @@ const {
   extractContainerFromMinerKey,
   resolveInterval,
   getIntervalConfig,
-  isRawInterval,
   rawIntervalStepMs,
   rawIntervalLimit,
   mergeGroupedField,
@@ -638,15 +637,18 @@ async function getGoupedHashrate (ctx, req) {
   // stat-1d answered a one-day request with the UTC day's row, stamped after `start`
   // and without a timeRange, so no pool sample paired with it.
   const interval = resolveInterval(start, end, req.query.interval)
-  // A raw interval reads one log entry per sample, which only the ungrouped series knows
-  // how to page. Grouped rows are rolled up from hourly buckets either way, so '5m' and
-  // '30m' land on the same hourly read a local interval does rather than on a null range.
-  const local = isLocalInterval(interval) || isRawInterval(interval)
+  const local = isLocalInterval(interval)
+  // Grouped rows honour a raw interval too - coarsening one here would answer at a
+  // resolution nobody asked for, the very thing this path exists to stop. The limit is
+  // what makes that safe: an ungrouped read is paged, and without one a null groupRange
+  // would reach the store unbounded.
+  const rawLimit = local ? null : rawIntervalLimit(interval, start, end)
 
   const res = await ctx.dataProxy.requestData(RPC_METHODS.TAIL_LOG, {
     type: WORKER_TYPES.MINER,
     tag: WORKER_TAGS.MINER,
     ...getIntervalConfig(local ? '1h' : interval),
+    ...(rawLimit && { limit: rawLimit }),
     shouldCalculateAvg: true,
     start,
     end,
